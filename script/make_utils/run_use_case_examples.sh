@@ -1,17 +1,6 @@
 #!/usr/bin/env bash
 set -e
 
-DIR=$(dirname "$0")
-
-# shellcheck disable=SC1090,SC1091
-source "${DIR}/detect_docker.sh"
-
-if isDocker; then
-    echo "Can not run in docker -> this script needs to install new virtualenvs"
-    exit 1
-fi
-
-
 CML_DIR=$(pwd)
 USE_CASE_REL_DIR="use_case_examples"
 USE_CASE_DIR="${CML_DIR}/${USE_CASE_REL_DIR}"
@@ -21,10 +10,9 @@ if [ ! -d "$USE_CASE_DIR" ]; then
     exit 1
 fi
 
-echo "Refreshing notebooks with PIP installed Concrete ML"
+echo "Running notebooks with PIP installed Concrete ML"
 
-# shellcheck disable=SC2143
-if [[ $(git ls-files --others --exclude-standard | grep ${USE_CASE_REL_DIR}) ]]; then
+if git ls-files --others --exclude-standard | grep -q "${USE_CASE_REL_DIR}"; then
     echo "This script must be run in a clean clone of the Concrete ML repo"
     echo "This directory has untracked files in ${USE_CASE_REL_DIR}"
     echo "You can LIST all untracked files using: "
@@ -51,23 +39,18 @@ else
   fi
 fi
 
-if [ ! "$(docker images -q zamafhe/concrete-ml:latest 2> /dev/null)" ]; then
-    # BUILD THE DOCKER IMAGE
-    echo "Building docker image"
-    poetry build && mkdir -p pkg && cp dist/* pkg/ && make release_docker
-    docker tag concrete-ml-release:latest zamafhe/concrete-ml:latest
-fi
+declare -a success_examples
+declare -a failed_examples
 
-# shellcheck disable=SC2068
-for EXAMPLE in ${LIST_OF_USE_CASES[@]}
+for EXAMPLE in "${LIST_OF_USE_CASES[@]}"
 do
     EXAMPLE_NAME=$(basename "${EXAMPLE}")
 
-    if [ -f "${EXAMPLE}/Makefile" ]; then
-        echo "*** Processing example ${EXAMPLE_NAME}"
-    else
+    if [ ! -f "${EXAMPLE}/Makefile" ]; then
         continue
     fi
+
+    echo "*** Processing example ${EXAMPLE_NAME}"
 
     # Setup a new venv
     VENV_PATH="/tmp/virtualenv_${EXAMPLE_NAME}"
@@ -75,55 +58,74 @@ do
         echo " - VirtualEnv already exists, deleting the old one"
         rm -rf "$VENV_PATH"
     fi
-    virtualenv -q "$VENV_PATH"
+    python3 -m venv "$VENV_PATH"
     echo " - VirtualEnv created at $VENV_PATH"
     # shellcheck disable=SC1090,SC1091
     source "${VENV_PATH}/bin/activate"
     # Install Concrete ML
-    set +e
     cd "$CML_DIR"
-    pip install -e . &> "/tmp/log_cml_pip_${EXAMPLE_NAME}"
+    pip install -U pip setuptools wheel
+    pip install -e .
     hresult=$?
     if [ $hresult -ne 0 ]; then
         echo "Could not install Concrete ML in the virtualenv, see /tmp/log_cml_pip_${EXAMPLE_NAME}"
         rm -rf "$VENV_PATH"
+        failed_examples+=("$EXAMPLE_NAME")
         continue
     fi
-    set -e
     echo " - Concrete ML installed in $VENV_PATH"
 
     # Install example requirements
     cd "$EXAMPLE"
     if [ -f "requirements.txt" ]; then
-        set +e
-        pip install -r requirements.txt &> "/tmp/log_reqs_${EXAMPLE_NAME}"
+        pip install -r requirements.txt
         hresult=$?
-        set -e
         if [ $hresult -ne 0 ]; then
-            echo "Could not install Concrete ML in the virtualenv, see /tmp/log_reqs_${EXAMPLE_NAME}"
+            echo "Could not install example requirements in the virtualenv, see /tmp/log_reqs_${EXAMPLE_NAME}"
             rm -rf "$VENV_PATH"
+            failed_examples+=("$EXAMPLE_NAME")
             continue
         fi     
         echo " - Requirements installed in $VENV_PATH"
     fi
     
     set +e
-    # Strip colors from the error output before piping to the log files
+# Strip colors from the error output before piping to the log files
     # Swap stderr and stdout, all output of jupyter execution is in stderr
     # The information about time spent running the notebook is in stdout
     # The following will pipe the stderr to the regex so that it 
     # ends up in the log file.
     # The timing shows in the terminal
-    USE_CASE_DIR=$USE_CASE_DIR make 3>&2 2>&1 1>&3- | perl -pe 's/\e([^\[\]]|\[.*?[a-zA-Z]|\].*?\a)//g' > "/tmp/log_${EXAMPLE_NAME}"
+    USE_CASE_DIR=$USE_CASE_DIR make 3>&2 2>&1 1>&3- | perl -pe 's/\e([^\[\]]|\[.*?[a-zA-Z]|\].*?\a)//g'
 
     # Neet to check the result of execution of the make command (ignore the results 
     # of the other commands in the pipe)
     hresult="${PIPESTATUS[0]}"
     if [ "$hresult" -ne 0 ]; then
-        echo "Error while running example ${EXAMPLE_NAME} see /tmp/log_${EXAMPLE_NAME}"
+        echo "Error while running example ${EXAMPLE_NAME}"
+        failed_examples+=("$EXAMPLE_NAME")
+    else
+        success_examples+=("$EXAMPLE_NAME")
     fi
     set -e             
 
     # Remove the virtualenv
     rm -rf "$VENV_PATH"
 done
+
+# Print summary
+echo
+echo "Summary:"
+echo "Successes: ${#success_examples[@]} examples"
+for example in "${success_examples[@]}"; do
+    echo "  - $example"
+done
+echo "Failures: ${#failed_examples[@]} examples"
+for example in "${failed_examples[@]}"; do
+    echo "  - $example"
+done
+
+# Exit with a failure status if there are any failures
+if [[ ${#failed_examples[@]} -gt 0 ]]; then
+    exit 1
+fi
