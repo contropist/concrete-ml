@@ -90,25 +90,24 @@ do
     fi
     
     set +e
-# Strip colors from the error output before piping to the log files
+    # Strip colors from the error output before piping to the log files
     # Swap stderr and stdout, all output of jupyter execution is in stderr
     # The information about time spent running the notebook is in stdout
     # The following will pipe the stderr to the regex so that it 
     # ends up in the log file.
     # The timing shows in the terminal
-    USE_CASE_DIR=$USE_CASE_DIR make 3>&2 2>&1 1>&3- | perl -pe 's/\e([^\[\]]|\[.*?[a-zA-Z]|\].*?\a)//g'
+    USE_CASE_DIR=$USE_CASE_DIR make 3>&2 2>&1 1>&3- | tee /dev/tty | perl -pe 's/\e([^\[\]]|\[.*?[a-zA-Z]|\].*?\a)//g'
 
     # Neet to check the result of execution of the make command (ignore the results 
     # of the other commands in the pipe)
     hresult="${PIPESTATUS[0]}"
+    set -e
     if [ "$hresult" -ne 0 ]; then
         echo "Error while running example ${EXAMPLE_NAME}"
         failed_examples+=("$EXAMPLE_NAME")
     else
         success_examples+=("$EXAMPLE_NAME")
     fi
-    set -e             
-
     # Remove the virtualenv
     rm -rf "$VENV_PATH"
 done
