@@ -218,7 +218,6 @@ def tree_onnx_graph_preprocessing(
         len(onnx_model.graph.output) == expected_number_of_outputs,
         on_error_msg=f"{len(onnx_model.graph.output)} != 2",
     )
-    onnx.save_model(onnx_model, "/src/model.onnx")
 
     # Check that a XGBoostRegressor onnx graph has the + 0.5 add node.
     if framework == "xgboost":
