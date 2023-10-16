@@ -13,7 +13,7 @@ from ..common.utils import (
     is_regressor_or_partial_regressor,
 )
 from ..onnx.convert import OPSET_VERSION_FOR_ONNX_EXPORT, get_equivalent_numpy_forward_from_onnx
-from ..onnx.onnx_model_manipulations import clean_graph_at_node_op_type, remove_node_types
+from ..onnx.onnx_model_manipulations import clean_graph_after_node_op_type, remove_node_types
 from ..quantization import QuantizedArray
 from ..quantization.quantizers import UniformQuantizer
 
@@ -130,12 +130,12 @@ def add_transpose_after_last_node(onnx_model: onnx.ModelProto):
     # Get the output node
     output_node = onnx_model.graph.output[0]
 
-    # Create the node with perm attribute equal to (2, 1, 0)
+    # Create the node with perm attribute equal to (1, 0)
     transpose_node = onnx.helper.make_node(
         "Transpose",
         inputs=[output_node.name],
         outputs=["transposed_output"],
-        perm=[2, 1, 0],
+        perm=[1, 0],
     )
 
     onnx_model.graph.node.append(transpose_node)
@@ -218,6 +218,7 @@ def tree_onnx_graph_preprocessing(
         len(onnx_model.graph.output) == expected_number_of_outputs,
         on_error_msg=f"{len(onnx_model.graph.output)} != 2",
     )
+    onnx.save_model(onnx_model, "/src/model.onnx")
 
     # Check that a XGBoostRegressor onnx graph has the + 0.5 add node.
     if framework == "xgboost":
@@ -226,9 +227,9 @@ def tree_onnx_graph_preprocessing(
         if len(onnx_model.graph.output) == 1:
             assert_add_node_and_constant_in_xgboost_regressor_graph(onnx_model)
 
-    # Cut the graph at the ReduceSum node as large sum are not yet supported.
-    # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/451
-    clean_graph_at_node_op_type(onnx_model, "ReduceSum")
+    # Cut the graph after the ReduceSum node to remove
+    # argmax, sigmoid, softmax from the graph.
+    clean_graph_after_node_op_type(onnx_model, "ReduceSum")
 
     if framework == "xgboost":
         # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/2778
