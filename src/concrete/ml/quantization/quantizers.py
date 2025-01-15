@@ -1,4 +1,5 @@
 """Quantization utilities for a numpy array/tensor."""
+
 # pylint: disable=too-many-lines
 from __future__ import annotations
 
@@ -6,21 +7,25 @@ from copy import deepcopy
 from typing import Any, Dict, Optional, TextIO, Union, get_type_hints
 
 import numpy
+import numpy.typing
+import torch
+from concrete.fhe.tracing.tracer import Tracer
 
 from ..common.debugging import assert_true
 from ..common.serialization.dumpers import dump, dumps
-from ..common.utils import QUANT_ROUND_LIKE_ROUND_PBS, array_allclose_and_same_shape
+from ..common.utils import QUANT_ROUND_LIKE_ROUND_PBS
 
 STABILITY_CONST = 10**-6
 
 
-def fill_from_kwargs(obj, klass, **kwargs):
+def fill_from_kwargs(obj, klass, accept_missing, **kwargs):
     """Fill a parameter set structure from kwargs parameters.
 
     Args:
         obj: an object of type klass, if None the object is created if any of the type's
             members appear in the kwargs
         klass: the type of object to fill
+        accept_missing: don't assert if the fields are None in the kwargs
         kwargs: parameter names and values to fill into an instance of the klass type
 
     Returns:
@@ -60,9 +65,16 @@ def fill_from_kwargs(obj, klass, **kwargs):
     # If the structure was created or modified by a call to this function, check
     # that it is completely filled
     if obj is not None:
-        for name in hints:
-            if getattr(obj, name) is None:
-                raise TypeError(f"Missing quantizer parameter {name}")
+        all_members_missing = all(getattr(obj, name) is None for name in hints)
+
+        if not accept_missing or (accept_missing and not all_members_missing):
+            missing_params_str = ",".join([name for name in hints if getattr(obj, name) is None])
+            given_params_str = ",".join([name for name in hints if getattr(obj, name) is not None])
+            if len(missing_params_str) > 0:
+                raise TypeError(
+                    f"Missing quantizer parameter {missing_params_str}, "
+                    f"but {given_params_str} were given"
+                )
 
     # Return the parameter structure and the kwargs with the used parameters removed
     return obj, kwargs
@@ -101,7 +113,11 @@ class QuantizationOptions:
     is_precomputed_qat: bool = False
 
     def __init__(
-        self, n_bits: int, is_signed: bool = False, is_symmetric: bool = False, is_qat: bool = False
+        self,
+        n_bits: int,
+        is_signed: bool = False,
+        is_symmetric: bool = False,
+        is_qat: bool = False,
     ):
         self.n_bits = n_bits
         self.is_signed = is_signed
@@ -232,25 +248,18 @@ class MinMaxQuantizationStats:
 
     rmax: Optional[float] = None
     rmin: Optional[float] = None
-    uvalues: Optional[numpy.ndarray] = None
 
     def __init__(
         self,
         rmax: Optional[float] = None,
         rmin: Optional[float] = None,
-        uvalues: Optional[numpy.ndarray] = None,
     ):
         self.rmax = rmax
         self.rmin = rmin
-        self.uvalues = uvalues
 
     def __eq__(self, other) -> bool:
         # Disable mypy as numpy.array_equal properly handles None types
-        return (
-            other.rmax == self.rmax
-            and other.rmin == self.rmin
-            and numpy.array_equal(other.uvalues, self.uvalues)  # type: ignore[arg-type]
-        )
+        return other.rmax == self.rmax and other.rmin == self.rmin
 
     def dump_dict(self) -> Dict:
         """Dump itself to a dict.
@@ -262,7 +271,6 @@ class MinMaxQuantizationStats:
 
         metadata["rmax"] = self.rmax
         metadata["rmin"] = self.rmin
-        metadata["uvalues"] = self.uvalues
         return metadata
 
     @staticmethod
@@ -278,7 +286,6 @@ class MinMaxQuantizationStats:
         to_return = MinMaxQuantizationStats(
             rmax=metadata["rmax"],
             rmin=metadata["rmin"],
-            uvalues=metadata["uvalues"],
         )
 
         return to_return
@@ -309,16 +316,6 @@ class MinMaxQuantizationStats:
         self.rmin = numpy.min(values)
         self.rmax = numpy.max(values)
 
-        # To find unique float values we need to round. We round to 2 decimal figures.
-        # Floating point inaccuracies in computation can lead to differences in the last
-        # decimal figures. We want to ignore such differences but also avoid
-        # coalescing float values that should be distinct
-        rvalues = numpy.round(values, decimals=2)
-
-        # Unique values from the distribution sample. These values are sorted
-        # in order to extract the quantization scale in the case of QAT
-        self.uvalues = numpy.unique(rvalues)
-
     @property
     def quant_stats(self):
         """Get a copy of the calibration set statistics.
@@ -341,35 +338,6 @@ class MinMaxQuantizationStats:
 
         self.rmax = stats.rmax
         self.rmin = stats.rmin
-        self.uvalues = stats.uvalues
-
-    def check_is_uniform_quantized(self, options: QuantizationOptions) -> bool:
-        """Check if these statistics correspond to uniformly quantized values.
-
-        Determines whether the values represented by this QuantizedArray show
-        a quantized structure that allows to infer the scale of quantization.
-
-        Args:
-            options (QuantizationOptions): used to quantize the values in the QuantizedArray
-
-        Returns:
-            bool: check result.
-        """
-
-        assert self.uvalues is not None
-
-        if self.uvalues.size > 2**options.n_bits:
-            return False
-
-        if self.uvalues.size == 1:
-            return False
-
-        unique_scales = numpy.unique(numpy.diff(self.uvalues))
-        min_scale = unique_scales[0]
-
-        re_quant_scales = numpy.rint(unique_scales / min_scale) * min_scale
-
-        return array_allclose_and_same_shape(unique_scales, re_quant_scales, atol=0.02)
 
 
 class UniformQuantizationParameters:
@@ -526,9 +494,6 @@ class UniformQuantizationParameters:
                     / ((2**options.n_bits - 1 - self.offset))
                 ).astype(numpy.float64)
             else:
-                # Infer the QAT parameters if this is a custom QAT network
-                # which does not store scale/zero-point in the ONNX directly.
-
                 # Do not infer the parameters if the network was trained with Brevitas
                 # they are stored in the ONNX file and are the true quantization parameters
                 # used in training - no need to infer them.
@@ -536,22 +501,6 @@ class UniformQuantizationParameters:
                 # If the parameters do not appear quantized, use PTQ for quantization.
                 # The QuantizedModule will perform error checking of quantized tensors
                 # and will issue an error if the network is not well quantized during training
-                if (
-                    options.is_qat
-                    and not options.is_precomputed_qat
-                    and stats.uvalues is not None
-                    and stats.check_is_uniform_quantized(options)
-                ):
-                    assert_true(
-                        len(stats.uvalues) > 1,
-                        "A single unique value was detected in a tensor of "
-                        "quantized values in a QAT import.\n"
-                        "Please check the stability thresholds.\n"
-                        "This can occur with a badly trained model.",
-                    )
-                    unique_scales = numpy.unique(numpy.diff(stats.uvalues))
-                    self.scale = numpy.float64(unique_scales[0])
-
                 if self.scale is None:
                     self.scale = numpy.float64(
                         (stats.rmax - stats.rmin) / (2**options.n_bits - 1)
@@ -627,7 +576,6 @@ class UniformQuantizer(UniformQuantizationParameters, QuantizationOptions, MinMa
             "is_precomputed_qat",
             "rmax",
             "rmin",
-            "uvalues",
             "scale",
             "zero_point",
             "offset",
@@ -666,7 +614,6 @@ class UniformQuantizer(UniformQuantizationParameters, QuantizationOptions, MinMa
             "is_precomputed_qat",
             "rmax",
             "rmin",
-            "uvalues",
             "scale",
             "zero_point",
             "offset",
@@ -700,7 +647,6 @@ class UniformQuantizer(UniformQuantizationParameters, QuantizationOptions, MinMa
             "is_precomputed_qat",
             "rmax",
             "rmin",
-            "uvalues",
             "scale",
             "zero_point",
             "offset",
@@ -708,10 +654,6 @@ class UniformQuantizer(UniformQuantizationParameters, QuantizationOptions, MinMa
         ]:
             if attribute in metadata:
                 setattr(obj, attribute, metadata[attribute])
-
-        # The `uvalues` attribute needs to be put back to a numpy.array object
-        if "uvalues" in metadata:
-            obj.uvalues = metadata["uvalues"]
 
         return obj
 
@@ -731,11 +673,14 @@ class UniformQuantizer(UniformQuantizationParameters, QuantizationOptions, MinMa
         """
         dump(self, file)
 
-    def quant(self, values: numpy.ndarray) -> numpy.ndarray:
+    def quant(
+        self, values: numpy.ndarray, dtype: numpy.typing.DTypeLike = numpy.int64
+    ) -> numpy.ndarray:
         """Quantize values.
 
         Args:
             values (numpy.ndarray): float values to quantize
+            dtype (numpy.typing.DTypeLike): optional user-specified datatype for the output
 
         Returns:
             numpy.ndarray: Integer quantized values.
@@ -746,18 +691,18 @@ class UniformQuantizer(UniformQuantizationParameters, QuantizationOptions, MinMa
         assert self.offset is not None
         assert self.scale is not None
 
+        assert dtype in (numpy.int64, numpy.int32, numpy.float32, numpy.float64)
+
         if QUANT_ROUND_LIKE_ROUND_PBS:
             qvalues = numpy.floor(values / self.scale + self.zero_point + 0.5)  # pragma: no cover
         else:
             qvalues = numpy.rint(values / self.scale + self.zero_point)
 
-        # Clipping can be performed for PTQ and for precomputed (for now only Brevitas) QAT
+        # Clipping must be performed for PTQ and for precomputed (for now only Brevitas) QAT
         # (where quantizer parameters are available in ONNX layers).
-        # For Custom QAT, with inferred parameters the type of quantization (signed/narrow)
-        # can not be inferred and thus clipping can not be performed reliably
         # It is possible to disable this clipping step for specific cases such as quantizing values
         # within fully-leveled circuits (where not bounds are needed)
-        if (not self.is_qat or self.is_precomputed_qat) and not self.no_clipping:
+        if not self.no_clipping:
             # Offset is either 2^(n-1) or 0, but for narrow range
             # the values should be clipped to [2^(n-1)+1, .. 2^(n-1)-1], so we add
             # one to the minimum value for narrow range
@@ -769,16 +714,18 @@ class UniformQuantizer(UniformQuantizationParameters, QuantizationOptions, MinMa
 
             qvalues = qvalues.clip(min_value, 2 ** (self.n_bits) - 1 - self.offset)
 
-        return qvalues.astype(numpy.int64)
+        qvalues = qvalues.astype(dtype)
 
-    def dequant(self, qvalues: numpy.ndarray) -> Union[Any, numpy.ndarray]:
+        return qvalues
+
+    def dequant(self, qvalues: numpy.ndarray) -> Union[float, numpy.ndarray, Tracer]:
         """De-quantize values.
 
         Args:
             qvalues (numpy.ndarray): integer values to de-quantize
 
         Returns:
-            Union[Any, numpy.ndarray]: De-quantized float values.
+            Union[numpy.ndarray, Tracer]: De-quantized float values.
         """
 
         # for mypy
@@ -787,15 +734,73 @@ class UniformQuantizer(UniformQuantizationParameters, QuantizationOptions, MinMa
 
         assert_true(
             isinstance(self.scale, (numpy.floating, float))
-            or (isinstance(self.scale, numpy.ndarray) and self.scale.dtype is numpy.float64),
+            or (isinstance(self.scale, numpy.ndarray) and self.scale.dtype == numpy.float64),
             "Scale is a of type "
             + type(self.scale).__name__
             + ((" " + str(self.scale.dtype)) if isinstance(self.scale, numpy.ndarray) else ""),
         )
 
-        ans = self.scale * (qvalues - numpy.asarray(self.zero_point, dtype=numpy.float64))
+        values = self.scale * (qvalues - numpy.asarray(self.zero_point, dtype=numpy.float64))
 
-        return ans
+        assert isinstance(values, (float, numpy.ndarray, Tracer)), f"{values=}, {type(values)=}"
+        return values
+
+
+class TorchUniformQuantizer:
+    """Uniform quantizer with a PyTorch implementation.
+
+    Contains all information necessary for uniform quantization and provides
+    quantization/de-quantization functionality on torch tensors.
+
+    Args:
+        quantizer (UniformQuantizer): Underlying numpy quantizer containing all parameters
+    """
+
+    _np_quant: UniformQuantizer
+
+    def __init__(self, quantizer: UniformQuantizer):
+        self._np_quant = quantizer
+
+    def quant(self, values: torch.Tensor, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+        """Quantize values.
+
+        Args:
+            values (numpy.ndarray): float values to quantize
+            dtype (Optional[torch.dtype]): optional user-specified datatype for the output
+
+        Returns:
+            numpy.ndarray: Integer quantized values.
+        """
+        qvalues = torch.round(values / self._np_quant.scale + self._np_quant.zero_point)
+
+        if not self._np_quant.no_clipping:
+            assert self._np_quant.offset is not None
+            min_value = -self._np_quant.offset
+            if self._np_quant.is_narrow:
+                min_value += 1
+
+            qvalues = torch.clip(
+                qvalues, min_value, 2 ** (self._np_quant.n_bits) - 1 - self._np_quant.offset
+            )
+
+        if dtype is not None:
+            qvalues = qvalues.type(dtype)
+
+        return qvalues
+
+    def dequant(self, qvalues: torch.Tensor) -> torch.Tensor:
+        """De-quantize values.
+
+        Args:
+            qvalues (numpy.ndarray): integer values to de-quantize
+
+        Returns:
+            Union[numpy.ndarray, Tracer]: De-quantized float values.
+        """
+        zp_tensor = torch.tensor(self._np_quant.zero_point).type(qvalues.dtype).to(qvalues.device)
+
+        values = self._np_quant.scale * (qvalues - zp_tensor)
+        return values
 
 
 class QuantizedArray:
@@ -824,13 +829,13 @@ class QuantizedArray:
     """
 
     quantizer: UniformQuantizer
-    values: numpy.ndarray
-    qvalues: numpy.ndarray
+    values: Union[numpy.ndarray, Tracer]
+    qvalues: Union[numpy.ndarray, Tracer]
 
     def __init__(
         self,
         n_bits,
-        values: Optional[numpy.ndarray],
+        values: Union[None, float, int, numpy.ndarray],
         value_is_float: bool = True,
         options: Optional[QuantizationOptions] = None,
         stats: Optional[MinMaxQuantizationStats] = None,
@@ -845,9 +850,13 @@ class QuantizedArray:
         options.n_bits = n_bits
         self.n_bits = n_bits
 
-        options, kwargs = fill_from_kwargs(options, QuantizationOptions, **kwargs)
-        stats, kwargs = fill_from_kwargs(stats, MinMaxQuantizationStats, **kwargs)
-        params, kwargs = fill_from_kwargs(params, UniformQuantizationParameters, **kwargs)
+        # Options are alawys needed
+        options, kwargs = fill_from_kwargs(options, QuantizationOptions, False, **kwargs)
+        # Stats are only necessary for quantization but not needed for dequantiztion
+        # thus they can be considered optional
+        stats, kwargs = fill_from_kwargs(stats, MinMaxQuantizationStats, True, **kwargs)
+        # Params are needed for both quant / dequant
+        params, kwargs = fill_from_kwargs(params, UniformQuantizationParameters, False, **kwargs)
 
         # All kwargs should belong to one of the parameter sets, anything else is unsupported
         if len(kwargs) > 0:
@@ -871,9 +880,9 @@ class QuantizedArray:
 
     def _values_setup(
         self,
-        values: numpy.ndarray,
+        values: Union[numpy.ndarray, float, int],
         value_is_float: bool,
-        options: QuantizationOptions = None,
+        options: Optional[QuantizationOptions] = None,
         stats: Optional[MinMaxQuantizationStats] = None,
         params: Optional[UniformQuantizationParameters] = None,
     ):
@@ -896,12 +905,17 @@ class QuantizedArray:
                     f"got {values.dtype}: {values}",
                 )
 
-            self.values = deepcopy(values) if isinstance(values, numpy.ndarray) else values
+            if isinstance(values, numpy.ndarray):
+                self.values = deepcopy(values)
+            elif isinstance(values, Tracer):
+                self.values = values
+            else:
+                self.values = numpy.array(values)
 
             # If no stats are provided, compute them.
             # Note that this cannot be done during tracing
             if stats is None:
-                self.quantizer.compute_quantization_stats(values)
+                self.quantizer.compute_quantization_stats(self.values)
 
             # If the quantization params are not provided, compute them
             # Note that during tracing, this does not use the tracer in any way and just
@@ -927,12 +941,17 @@ class QuantizedArray:
                     "when int/uint was required",
                 )
 
-            self.qvalues = deepcopy(values) if isinstance(values, numpy.ndarray) else values
+            if isinstance(values, numpy.ndarray):
+                self.qvalues = deepcopy(values)
+            elif isinstance(values, Tracer):
+                self.qvalues = values
+            else:
+                self.qvalues = numpy.array(values)  # pragma: no cover
 
             # Populate self.values
             self.dequant()
 
-    def __call__(self) -> Optional[numpy.ndarray]:
+    def __call__(self) -> Union[numpy.ndarray, Tracer]:
         return self.qvalues
 
     def dump_dict(self) -> Dict:
@@ -983,51 +1002,61 @@ class QuantizedArray:
         """
         dump(self, file)
 
-    def update_values(self, values: numpy.ndarray) -> numpy.ndarray:
+    def update_values(self, values: Union[numpy.ndarray, Tracer]) -> Union[numpy.ndarray, Tracer]:
         """Update values to get their corresponding qvalues using the related quantized parameters.
 
         Args:
-            values (numpy.ndarray): Values to replace self.values
+            values (Union[numpy.ndarray, Tracer]): Values to replace self.values
 
         Returns:
-            qvalues (numpy.ndarray): Corresponding qvalues
+            qvalues (Union[numpy.ndarray, Tracer]): Corresponding qvalues
         """
-        self.values = deepcopy(values) if isinstance(values, numpy.ndarray) else values
-        self.quant()
-        return self.qvalues
+        if isinstance(values, numpy.ndarray):
+            self.values = deepcopy(values)
+        elif isinstance(values, Tracer):  # pragma: no cover
+            self.values = values
+        else:  # pragma: no cover
+            self.values = numpy.array(values)
+        return self.quant()
 
-    def update_quantized_values(self, qvalues: numpy.ndarray) -> numpy.ndarray:
+    def update_quantized_values(
+        self, qvalues: Union[numpy.ndarray, Tracer]
+    ) -> Union[numpy.ndarray, Tracer]:
         """Update qvalues to get their corresponding values using the related quantized parameters.
 
         Args:
-            qvalues (numpy.ndarray): Values to replace self.qvalues
+            qvalues (Union[numpy.ndarray, Tracer]): Values to replace self.qvalues
 
         Returns:
-            values (numpy.ndarray): Corresponding values
+            values (Union[numpy.ndarray, Tracer]): Corresponding values
         """
-        self.qvalues = deepcopy(qvalues) if isinstance(qvalues, numpy.ndarray) else qvalues
-        self.dequant()
-        return self.values
+        if isinstance(qvalues, numpy.ndarray):
+            self.qvalues = deepcopy(qvalues)
+        elif isinstance(qvalues, Tracer):  # pragma: no cover
+            self.qvalues = qvalues
+        else:  # pragma: no cover
+            self.qvalues = numpy.array(qvalues)
+        return self.dequant()
 
-    def quant(self) -> Optional[numpy.ndarray]:
+    def quant(self) -> Union[numpy.ndarray, Tracer]:
         """Quantize self.values.
 
         Returns:
-            numpy.ndarray: Quantized values.
+            Union[numpy.ndarray, Tracer]: Quantized values.
         """
 
         self.qvalues = self.quantizer.quant(self.values)
         return self.qvalues
 
-    def dequant(self) -> numpy.ndarray:
+    def dequant(self) -> Union[numpy.ndarray, Tracer]:
         """De-quantize self.qvalues.
 
         Returns:
-            numpy.ndarray: De-quantized values.
+            Union[numpy.ndarray, Tracer]: De-quantized values.
         """
         self.values = self.quantizer.dequant(self.qvalues)
         assert_true(
             not isinstance(self.values, numpy.ndarray) or self.values.dtype == numpy.float64,
-            "De-quantized values must be float64",
+            "De-quantized values must be float64 but got: " f"{type(self.values)=}",
         )
         return self.values

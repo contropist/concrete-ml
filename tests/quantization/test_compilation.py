@@ -1,4 +1,5 @@
 """Test Neural Networks compilations"""
+
 import numpy
 import onnx
 import pytest
@@ -26,6 +27,8 @@ from concrete.ml.torch.numpy_module import NumpyModule
 INPUT_OUTPUT_FEATURE = [1, 2, 3]
 
 
+# FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4172
+@pytest.mark.flaky
 @pytest.mark.parametrize(
     "model",
     [pytest.param(FCSmall), pytest.param(FCSeq), pytest.param(FCSeqAddBiasVec)],
@@ -152,6 +155,8 @@ class NumpyModuleTest(NumpyModule):
     def __init__(self, onnx_model: onnx.ModelProto):
         self.numpy_forward = lambda x: x
         self._onnx_model = onnx_model
+        self._numpy_preprocessing = lambda x: x
+        self._onnx_preprocessing = None
 
 
 def test_post_training_quantization_constant_folding():

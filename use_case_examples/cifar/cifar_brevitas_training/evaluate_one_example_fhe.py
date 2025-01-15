@@ -1,16 +1,18 @@
+import json
 import os
 import time
 from functools import partial
+from importlib.metadata import version
 from pathlib import Path
 
 import torch
+from concrete.compiler import check_gpu_available
+from concrete.fhe import Exactness
 from concrete.fhe.compilation.configuration import Configuration
 from models import cnv_2w2a
 from torch.utils.data import DataLoader
 from trainer import get_test_set
 
-from concrete import fhe
-from concrete.ml.deployment.fhe_client_server import FHEModelDev
 from concrete.ml.quantization import QuantizedModule
 from concrete.ml.torch.compile import compile_brevitas_qat_model
 
@@ -21,7 +23,10 @@ KEYGEN_CACHE_DIR = CURRENT_DIR.joinpath(".keycache")
 # observe a decrease in torch's top1 accuracy when using MPS devices
 # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/3953
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+COMPILATION_DEVICE = "cuda" if check_gpu_available() else "cpu"
+
 NUM_SAMPLES = int(os.environ.get("NUM_SAMPLES", 1))
+P_ERROR = float(os.environ.get("P_ERROR", 0.01))
 
 
 def measure_execution_time(func):
@@ -85,12 +90,15 @@ configuration = Configuration(
 print("Compiling the model.")
 quantized_numpy_module, compilation_execution_time = measure_execution_time(
     compile_brevitas_qat_model
-)(torch_model, x, configuration=configuration, rounding_threshold_bits=6, p_error=0.01)
+)(
+    torch_model,
+    x,
+    configuration=configuration,
+    rounding_threshold_bits={"method": Exactness.APPROXIMATE, "n_bits": 6},
+    p_error=P_ERROR,
+    device=COMPILATION_DEVICE,
+)
 assert isinstance(quantized_numpy_module, QuantizedModule)
-
-# Save the client/server files to disk.
-dev = FHEModelDev(path_dir="./client_server", model=quantized_numpy_module)
-dev.save()
 
 print(f"Compilation time took {compilation_execution_time} seconds")
 
@@ -134,11 +142,8 @@ for image_index in range(NUM_SAMPLES):
     print(f"Quantization of a single input (image) took {quantization_execution_time} seconds")
     print(f"Size of CLEAR input is {q_x_numpy.nbytes} bytes\n")
 
-    # Use new VL with .simulate() once CP's multi-parameter/precision bug is fixed
-    # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/3856
-    p_error = quantized_numpy_module.fhe_circuit.p_error
     expected_quantized_prediction, clear_inference_time = measure_execution_time(
-        partial(quantized_numpy_module.fhe_circuit.graph, p_error=p_error)
+        partial(quantized_numpy_module.fhe_circuit.simulate)
     )(q_x_numpy)
 
     # Encrypt the input
@@ -180,6 +185,7 @@ for image_index in range(NUM_SAMPLES):
         "decryption_time": decryption_execution_time,
         "inference_time": clear_inference_time,
         "label": labels[image_index].item(),
+        "p_error": P_ERROR,
     }
 
     for prediction_index, prediction in enumerate(expected_quantized_prediction[0]):
@@ -201,3 +207,11 @@ with open("inference_results.csv", "w", encoding="utf-8") as file:
     # Write the data rows
     for result in all_results:
         file.write(",".join(str(result[column]) for column in columns) + "\n")
+
+metadata = {
+    "p_error": P_ERROR,
+    "cml_version": version("concrete-ml"),
+    "cnp_version": version("concrete-python"),
+}
+with open("metadata.json", "w") as file:
+    json.dump(metadata, file)

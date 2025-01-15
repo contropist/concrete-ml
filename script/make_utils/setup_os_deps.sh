@@ -43,7 +43,7 @@ linux_install_gitleaks () {
         tar -xvf "${DOWNLOADED_FILE}" -C "${TMP_WORKDIR}"
         GITLEAKS_BIN="${TMP_WORKDIR}/gitleaks"
         chmod +x "${GITLEAKS_BIN}"
-        cp "${GITLEAKS_BIN}" /usr/local/bin/
+        ${SUDO_BIN:+$SUDO_BIN} cp "${GITLEAKS_BIN}" /usr/local/bin/
     else
         echo "Hash mismatch"
         echo "Got sha256:           ${SHA256_DOWNLOADED_FILE}"
@@ -69,7 +69,7 @@ linux_install_actionlint () {
         tar -xvf "${DOWNLOADED_FILE}" -C "${TMP_WORKDIR}"
         ACTIONLINT_BIN="${TMP_WORKDIR}/actionlint"
         chmod +x "${ACTIONLINT_BIN}"
-        cp "${ACTIONLINT_BIN}" /usr/local/bin/
+        ${SUDO_BIN:+$SUDO_BIN} cp "${ACTIONLINT_BIN}" /usr/local/bin/
     else
         echo "Hash mismatch"
         echo "Got sha256:           ${SHA256_DOWNLOADED_FILE}"
@@ -84,32 +84,64 @@ linux_install_github_cli () {
     # Installs github cli
     # https://github.com/cli/cli/blob/trunk/docs/install_linux.md#debian-ubuntu-linux-raspberry-pi-os-apt
     echo "Installing github-CLI"
-    wget https://github.com/cli/cli/releases/download/v2.14.7/gh_2.14.7_linux_amd64.deb
-    dpkg -i gh_2.14.7_linux_amd64.deb
+    export GH_CLI_VERSION="2.51.0"
+    wget -P "$HOME" https://github.com/cli/cli/releases/download/v${GH_CLI_VERSION}/gh_${GH_CLI_VERSION}_linux_amd64.deb
+    ${SUDO_BIN:+$SUDO_BIN} dpkg -i "$HOME/gh_${GH_CLI_VERSION}_linux_amd64.deb"
+}
+
+linux_install_cmake () {
+    # Install lsb-release if not present
+    if ! command -v lsb_release >/dev/null 2>&1; then
+        ${SUDO_BIN:+$SUDO_BIN} apt-get update
+        ${SUDO_BIN:+$SUDO_BIN} apt-get -y install lsb-release
+    fi
+
+    # Get Ubuntu version codename
+    UBUNTU_CODENAME=$(lsb_release -cs)
+    
+    # For Ubuntu 22.04 (jammy) and newer, use the default package
+    if [[ "${UBUNTU_CODENAME}" == "jammy" || "${UBUNTU_CODENAME}" > "jammy" ]]; then
+        ${SUDO_BIN:+$SUDO_BIN} apt-get update
+        ${SUDO_BIN:+$SUDO_BIN} apt-get -y install cmake
+        return
+    fi
+    
+    # For Ubuntu 20.04 (focal) and older, use Kitware's repository
+    ${SUDO_BIN:+$SUDO_BIN} apt-get update
+    ${SUDO_BIN:+$SUDO_BIN} apt-get -y install ca-certificates gpg wget
+    test -f /usr/share/doc/kitware-archive-keyring/copyright ||
+    wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | \
+        gpg --dearmor - | \
+        ${SUDO_BIN:+$SUDO_BIN} tee /usr/share/keyrings/kitware-archive-keyring.gpg >/dev/null
+    echo "deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ ${UBUNTU_CODENAME} main" | \
+        ${SUDO_BIN:+$SUDO_BIN} tee /etc/apt/sources.list.d/kitware.list >/dev/null
+    ${SUDO_BIN:+$SUDO_BIN} apt-get update
+    test -f /usr/share/doc/kitware-archive-keyring/copyright || \
+        ${SUDO_BIN:+$SUDO_BIN} rm /usr/share/keyrings/kitware-archive-keyring.gpg
+    ${SUDO_BIN:+$SUDO_BIN} apt-get install -y kitware-archive-keyring
+    echo "deb [signed-by=/usr/share/keyrings/kitware-archive-keyring.gpg] https://apt.kitware.com/ubuntu/ ${UBUNTU_CODENAME}-rc main" | \
+        ${SUDO_BIN:+$SUDO_BIN} tee -a /etc/apt/sources.list.d/kitware.list >/dev/null
+    ${SUDO_BIN:+$SUDO_BIN} apt-get update
+    ${SUDO_BIN:+$SUDO_BIN} apt-get -y install cmake
 }
 
 OS_NAME=$(uname)
 
 if [[ "${OS_NAME}" == "Linux" ]]; then
     # Docker build
-    if isDockerBuildkit || (isDocker && ! isDockerContainer); then
-        CLEAR_APT_LISTS="rm -rf /var/lib/apt/lists/* &&"
-        SUDO_BIN=""
-    else
-        CLEAR_APT_LISTS=""
-        SUDO_BIN="$(command -v sudo)"
-        if [[ "${SUDO_BIN}" != "" ]]; then
-            SUDO_BIN="${SUDO_BIN} "
-        fi
+    CLEAR_APT_LISTS=""
+    SUDO_BIN="$(command -v sudo)"
+    if [[ "${SUDO_BIN}" != "" ]]; then
+        SUDO_BIN="${SUDO_BIN} "
     fi
-
+   
     PYTHON_PACKAGES=
     if [[ "${LINUX_INSTALL_PYTHON}" == "1" ]]; then
         PYTHON_PACKAGES="python3-pip \
-        python3.8 \
-        python3.8-dev \
-        python3.8-tk \
-        python3.8-venv \
+        python3 \
+        python3-dev \
+        python3-tk \
+        python3-venv \
         python-is-python3 \
         "
     fi
@@ -118,7 +150,8 @@ if [[ "${OS_NAME}" == "Linux" ]]; then
     then
         SETUP_CMD="linux_install_actionlint"
     else
-        SETUP_CMD="${SUDO_BIN:+$SUDO_BIN}apt-get update && apt-get upgrade --no-install-recommends -y && \
+        SETUP_CMD="${SUDO_BIN:+$SUDO_BIN}apt-get update && \
+        ${SUDO_BIN:+$SUDO_BIN}apt-get upgrade --no-install-recommends -y && \
         ${SUDO_BIN:+$SUDO_BIN}apt-get install --no-install-recommends -y \
         build-essential \
         curl \
@@ -129,19 +162,30 @@ if [[ "${OS_NAME}" == "Linux" ]]; then
         jq \
         make \
         rsync \
-        cmake \
         unzip \
         pandoc \
         openssl \
         shellcheck \
+        libssl-dev \
         texlive-latex-base texlive-latex-extra texlive-fonts-recommended texlive-xetex lmodern \
-        wget && \
+        wget pipx &&
         ${CLEAR_APT_LISTS:+$CLEAR_APT_LISTS} \
-        python3 -m pip install --no-cache-dir --upgrade pip && \
-        python3 -m pip install --no-cache-dir --ignore-installed poetry==1.2.2 && \
-        linux_install_gitleaks && linux_install_actionlint && linux_install_github_cli"
+        linux_install_gitleaks && \
+        linux_install_actionlint && \
+        linux_install_github_cli && \
+        linux_install_cmake"
     fi
     eval "${SETUP_CMD}"
+
+
+    # Install poetry, either with pipx for ubuntu >= 23
+    # or through regular pip for older ubuntu
+    (\
+        python3 -m pip install --no-cache-dir --upgrade pip && \
+        python3 -m pip install --no-cache-dir --ignore-installed poetry==1.8.4 \
+    ) || (pipx install poetry==1.8.4 && pipx ensurepath);
+
+    echo "PATH=$PATH:$HOME/.local/bin/" >> "$HOME/.bashrc"
 elif [[ "${OS_NAME}" == "Darwin" ]]; then
 
     # Some problems with the git which is preinstalled on AWS virtual machines. Let's unlink it
@@ -151,7 +195,7 @@ elif [[ "${OS_NAME}" == "Darwin" ]]; then
 
     brew install curl git git-lfs gitleaks graphviz jq make pandoc shellcheck openssl libomp actionlint unzip gh rsync
     python3 -m pip install -U pip
-    python3 -m pip install poetry==1.2.2
+    python3 -m pip install poetry==1.8.4
 
     echo "Make is currently installed as gmake"
     echo 'If you need to use it as "make", you can add a "gnubin" directory to your PATH from your bashrc like:'

@@ -3,8 +3,9 @@
 import json
 import sys
 import zipfile
+from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Tuple, Union
 
 import numpy
 
@@ -13,7 +14,10 @@ from concrete import fhe
 from ..common.debugging.custom_assert import assert_true
 from ..common.serialization.dumpers import dump
 from ..common.serialization.loaders import load
+from ..common.utils import to_tuple
+from ..quantization import QuantizedModule
 from ..version import __version__ as CML_VERSION
+from ._utils import deserialize_encrypted_values, serialize_encrypted_values
 
 try:
     # 3.8 and above
@@ -23,6 +27,25 @@ except ImportError:  # pragma: no cover
     # 3.7 and below
     # pylint: disable-next=no-name-in-module
     from importlib_metadata import version
+
+
+class DeploymentMode(Enum):
+    """Mode for the FHE API."""
+
+    INFERENCE = "inference"
+    TRAINING = "training"
+
+    @staticmethod
+    def is_valid(mode: Union["DeploymentMode", str]) -> bool:
+        """Indicate if the given name is a supported mode.
+
+        Args:
+            mode (Union[Mode, str]): The mode to check.
+
+        Returns:
+            bool: Whether the mode is supported or not.
+        """
+        return mode in {member.value for member in DeploymentMode.__members__.values()}
 
 
 def check_concrete_versions(zip_path: Path):
@@ -41,6 +64,7 @@ def check_concrete_versions(zip_path: Path):
     """
 
     with zipfile.ZipFile(zip_path) as zip_file:
+        is_mlir = "circuit.mlir" in zip_file.namelist()
         with zip_file.open("versions.json", mode="r") as file:
             versions = json.load(file)
 
@@ -68,14 +92,16 @@ def check_concrete_versions(zip_path: Path):
             + "\n".join(f"{error[0]}: {error[1]} != {error[2]}" for error in errors)
         )
 
-    # Raise an error if the Python version do not match the one currently installed
-    if not versions["python"].startswith(
-        f"{sys.version_info.major}.{sys.version_info.minor}"
-    ):  # pragma: no cover
-        raise ValueError(
-            "Not the same Python version between the compiler and the server."
-            f"{versions['python']} != {sys.version_info.major}.{sys.version_info.minor}"
-        )
+    if not is_mlir:
+        # Raise an error if the Python version do not match the one currently installed
+        if not versions["python"].startswith(
+            f"{sys.version_info.major}.{sys.version_info.minor}"
+        ):  # pragma: no cover
+            raise ValueError(
+                "Not the same Python version between the zip file "
+                "({zip_path}) and the current machine: "
+                f"{versions['python']} != {sys.version_info.major}.{sys.version_info.minor}"
+            )
 
 
 class FHEModelServer:
@@ -103,32 +129,70 @@ class FHEModelServer:
 
         self.server = fhe.Server.load(Path(self.path_dir).joinpath("server.zip"))
 
+    # We should make 'serialized_encrypted_quantized_data' handle unpacked inputs, as Concrete does,
+    # instead of tuples
+    # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4477
+    # We should also rename the input arguments to remove the `serialized` part, as we now accept
+    # both serialized and deserialized input values
+    # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4476
     def run(
         self,
-        serialized_encrypted_quantized_data: bytes,
+        serialized_encrypted_quantized_data: Union[
+            bytes, fhe.Value, Tuple[bytes, ...], Tuple[fhe.Value, ...]
+        ],
         serialized_evaluation_keys: bytes,
-    ) -> bytes:
+    ) -> Union[bytes, fhe.Value, Tuple[bytes, ...], Tuple[fhe.Value, ...]]:
         """Run the model on the server over encrypted data.
 
         Args:
-            serialized_encrypted_quantized_data (bytes): the encrypted, quantized
-                and serialized data
-            serialized_evaluation_keys (bytes): the serialized evaluation keys
+            serialized_encrypted_quantized_data (Union[bytes, fhe.Value, Tuple[bytes, ...], \
+                Tuple[fhe.Value, ...]]): The encrypted and quantized values to consider. If these
+                values are serialized (in bytes), they are first deserialized.
+            serialized_evaluation_keys (bytes): The evaluation keys. If they are serialized (in
+                bytes), they are first deserialized.
 
         Returns:
-            bytes: the result of the model
+            Union[bytes, fhe.Value, Tuple[bytes, ...], Tuple[fhe.Value, ...]]: The model's encrypted
+                and quantized results. If the inputs were initially serialized, the outputs are also
+                serialized.
         """
+
+        # TODO: make desr / ser optional
         assert_true(self.server is not None, "Model has not been loaded.")
 
-        deserialized_encrypted_quantized_data = fhe.Value.deserialize(
-            serialized_encrypted_quantized_data
+        input_quant_encrypted = to_tuple(serialized_encrypted_quantized_data)
+
+        # Make sure no inputs are None, to avoid any crash in Concrete
+        assert not any(x is None for x in input_quant_encrypted), "No input values should be None"
+
+        inputs_are_serialized = all(isinstance(x, bytes) for x in input_quant_encrypted)
+        inputs_are_encrypted_values = all(isinstance(x, fhe.Value) for x in input_quant_encrypted)
+
+        # Make sure inputs are either only serialized values or encrypted values
+        assert (
+            inputs_are_serialized ^ inputs_are_encrypted_values
+        ), "Inputs must be all of the same types, either 'bytes' or 'concrete.fhe.Value'"
+
+        # Deserialize the values if they are all serialized
+        if inputs_are_serialized:
+            input_quant_encrypted = to_tuple(deserialize_encrypted_values(*input_quant_encrypted))
+
+        # Deserialize the evaluation keys if they are serialized
+        evaluation_keys = serialized_evaluation_keys
+        if isinstance(evaluation_keys, bytes):
+            evaluation_keys = fhe.EvaluationKeys.deserialize(evaluation_keys)
+
+        result_quant_encrypted = self.server.run(
+            *input_quant_encrypted, evaluation_keys=evaluation_keys
         )
-        deserialized_evaluation_keys = fhe.EvaluationKeys.deserialize(serialized_evaluation_keys)
-        result = self.server.run(
-            deserialized_encrypted_quantized_data, evaluation_keys=deserialized_evaluation_keys
-        )
-        serialized_result = result.serialize()
-        return serialized_result
+
+        # If inputs were serialized, return serialized values as well
+        if inputs_are_serialized:
+            result_quant_encrypted = serialize_encrypted_values(*to_tuple(result_quant_encrypted))
+
+        # Mypy complains because the outputs of `serialize_encrypted_values` can be None, but here
+        # we already made sure this is not the case
+        return result_quant_encrypted  # type: ignore[return-value]
 
 
 class FHEModelDev:
@@ -149,17 +213,22 @@ class FHEModelDev:
 
         Path(self.path_dir).mkdir(parents=True, exist_ok=True)
 
-    def _export_model_to_json(self) -> Path:
+    def _export_model_to_json(self, is_training: bool = False) -> Path:
         """Export the quantizers to a json file.
+
+        Args:
+            is_training (bool): If True, we export the training circuit.
 
         Returns:
             Path: the path to the json file
         """
+        module_to_export = self.model.training_quantized_module if is_training else self.model
         serialized_processing = {
-            "model_type": self.model.__class__,
-            "model_post_processing_params": self.model.post_processing_params,
-            "input_quantizers": self.model.input_quantizers,
-            "output_quantizers": self.model.output_quantizers,
+            "model_type": module_to_export.__class__,
+            "model_post_processing_params": module_to_export.post_processing_params,
+            "input_quantizers": module_to_export.input_quantizers,
+            "output_quantizers": module_to_export.output_quantizers,
+            "is_training": is_training,
         }
 
         # Export the `is_fitted` attribute for built-in models
@@ -173,42 +242,58 @@ class FHEModelDev:
 
         return json_path
 
-    def save(self, via_mlir: bool = False):
+    def save(self, mode: DeploymentMode = DeploymentMode.INFERENCE, via_mlir: bool = True):
         """Export all needed artifacts for the client and server.
 
         Arguments:
+            mode (DeploymentMode): the mode to save the FHE circuit,
+                either "inference" or "training".
             via_mlir (bool): serialize with `via_mlir` option from Concrete-Python.
-                For more details on the topic please refer to Concrete-Python's documentation.
 
         Raises:
-            Exception: path_dir is not empty
+            Exception: path_dir is not empty or training module does not exist
+            ValueError: if mode is not "inference" or "training"
         """
+
+        if isinstance(mode, str):
+            mode_lower = mode.lower()
+            if not DeploymentMode.is_valid(mode_lower):
+                raise ValueError("Mode must be either 'inference' or 'training'")
+            mode = DeploymentMode(mode_lower)
+
+        # Get fhe_circuit based on the mode
+        if mode == DeploymentMode.TRAINING:
+
+            # Check that training FHE circuit exists
+            assert_true(
+                hasattr(self.model, "training_quantized_module")
+                and (self.model.training_quantized_module),
+                "Training FHE circuit does not exist.",
+            )
+            self.model.training_quantized_module.check_model_is_compiled()
+            fhe_circuit = self.model.training_quantized_module.fhe_circuit
+        else:
+            self.model.check_model_is_compiled()
+            fhe_circuit = self.model.fhe_circuit
+
         # Check if the path_dir is empty with pathlib
         listdir = list(Path(self.path_dir).glob("**/*"))
         if len(listdir) > 0:
             raise Exception(
-                f"path_dir: {self.path_dir} is not empty."
+                f"path_dir: {self.path_dir} is not empty. "
                 "Please delete it before saving a new model."
             )
-        self.model.check_model_is_compiled()
-
-        # Model must be compiled with jit=False
-        # In a jit model, everything is in memory so it is not serializable.
-        assert_true(
-            not self.model.fhe_circuit.configuration.jit,
-            "The model must be compiled with the configuration option jit=False.",
-        )
 
         # Export the quantizers
-        json_path = self._export_model_to_json()
+        json_path = self._export_model_to_json(is_training=(mode == DeploymentMode.TRAINING))
 
-        # First save the circuit for the server
+        # Save the circuit for the server
         path_circuit_server = Path(self.path_dir).joinpath("server.zip")
-        self.model.fhe_circuit.server.save(path_circuit_server, via_mlir=via_mlir)
+        fhe_circuit.server.save(path_circuit_server, via_mlir=via_mlir)
 
         # Save the circuit for the client
         path_circuit_client = Path(self.path_dir).joinpath("client.zip")
-        self.model.fhe_circuit.client.save(path_circuit_client)
+        fhe_circuit.client.save(path_circuit_client)
 
         with zipfile.ZipFile(path_circuit_client, "a") as zip_file:
             zip_file.write(filename=json_path, arcname="serialized_processing.json")
@@ -229,6 +314,7 @@ class FHEModelDev:
         with zipfile.ZipFile(path_circuit_client, "a") as zip_file:
             zip_file.write(filename=versions_path, arcname="versions.json")
 
+        versions_path.unlink()
         json_path.unlink()
 
 
@@ -271,6 +357,8 @@ class FHEModelClient:
 
         # Initialize the model
         self.model = serialized_processing["model_type"]()
+
+        # Load the quantizers
         self.model.input_quantizers = serialized_processing["input_quantizers"]
         self.model.output_quantizers = serialized_processing["output_quantizers"]
 
@@ -301,74 +389,90 @@ class FHEModelClient:
         Returns:
             bytes: the evaluation keys
         """
+        # Generate private and evaluation keys if not already generated
+        self.generate_private_and_evaluation_keys(force=False)
+
         return self.client.evaluation_keys.serialize()
 
-    def quantize_encrypt_serialize(self, x: numpy.ndarray) -> bytes:
+    def quantize_encrypt_serialize(
+        self, *x: Optional[numpy.ndarray]
+    ) -> Union[Optional[bytes], Tuple[Optional[bytes], ...]]:
         """Quantize, encrypt and serialize the values.
 
         Args:
-            x (numpy.ndarray): the values to quantize, encrypt and serialize
+            x (Optional[numpy.ndarray]): The values to quantize, encrypt and serialize.
 
         Returns:
-            bytes: the quantized, encrypted and serialized values
+            Union[bytes, Tuple[bytes, ...]]: The quantized, encrypted and serialized values.
         """
+
         # Quantize the values
-        quantized_x = self.model.quantize_input(x)
+        x_quant = to_tuple(self.model.quantize_input(*x))
 
         # Encrypt the values
-        enc_qx = self.client.encrypt(quantized_x)
+        x_quant_encrypted = to_tuple(self.client.encrypt(*x_quant))
 
         # Serialize the encrypted values to be sent to the server
-        serialized_enc_qx = enc_qx.serialize()
-        return serialized_enc_qx
+        x_quant_encrypted_serialized = serialize_encrypted_values(*x_quant_encrypted)
 
-    def deserialize_decrypt(self, serialized_encrypted_quantized_result: bytes) -> numpy.ndarray:
+        return x_quant_encrypted_serialized
+
+    # We should find a better name for `serialized_encrypted_quantized_result`
+    # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4476
+    def deserialize_decrypt(
+        self, *serialized_encrypted_quantized_result: Optional[bytes]
+    ) -> Union[Any, Tuple[Any, ...]]:
         """Deserialize and decrypt the values.
 
         Args:
-            serialized_encrypted_quantized_result (bytes): the serialized, encrypted
-                and quantized result
+            serialized_encrypted_quantized_result (Optional[bytes]): The serialized, encrypted and
+                quantized values.
 
         Returns:
-            numpy.ndarray: the decrypted and deserialized values
+            Union[Any, Tuple[Any, ...]]: The decrypted and deserialized values.
         """
         # Deserialize the encrypted values
-        deserialized_encrypted_quantized_result = fhe.Value.deserialize(
-            serialized_encrypted_quantized_result
+        result_quant_encrypted = to_tuple(
+            deserialize_encrypted_values(*serialized_encrypted_quantized_result)
         )
 
         # Decrypt the values
-        deserialized_decrypted_quantized_result = self.client.decrypt(
-            deserialized_encrypted_quantized_result
-        )
-        assert isinstance(deserialized_decrypted_quantized_result, numpy.ndarray)
-        return deserialized_decrypted_quantized_result
+        result_quant = self.client.decrypt(*result_quant_encrypted)
 
+        return result_quant
+
+    # We should find a better name for `serialized_encrypted_quantized_result`
+    # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4476
     def deserialize_decrypt_dequantize(
-        self, serialized_encrypted_quantized_result: bytes
-    ) -> numpy.ndarray:
+        self, *serialized_encrypted_quantized_result: Optional[bytes]
+    ) -> Union[numpy.ndarray, Tuple[numpy.ndarray, ...]]:
         """Deserialize, decrypt and de-quantize the values.
 
         Args:
-            serialized_encrypted_quantized_result (bytes): the serialized, encrypted
-                and quantized result
+            serialized_encrypted_quantized_result (Optional[bytes]): The serialized, encrypted and
+                quantized result
 
         Returns:
-            numpy.ndarray: the decrypted (de-quantized) values
+            Union[numpy.ndarray, Tuple[numpy.ndarray, ...]]: The clear float values.
         """
         # Decrypt and deserialize the values
-        deserialized_decrypted_quantized_result = self.deserialize_decrypt(
-            serialized_encrypted_quantized_result
-        )
+        result_quant = to_tuple(self.deserialize_decrypt(*serialized_encrypted_quantized_result))
 
         # De-quantize the values
-        deserialized_decrypted_dequantized_result = self.model.dequantize_output(
-            deserialized_decrypted_quantized_result
-        )
+        result = to_tuple(self.model.dequantize_output(*result_quant))
 
-        # Apply post-processing the to de-quantized values
-        deserialized_decrypted_dequantized_result = self.model.post_processing(
-            deserialized_decrypted_dequantized_result
-        )
+        # Apply post-processing to the de-quantized values
+        # Side note: `post_processing` method from built-in models (not Quantized Modules) only
+        # handles a single input. Calling the following is however not an issue for now as we expect
+        # 'result' to be a tuple of length 1 in this case anyway. Still, we need to make sure this
+        # does not break in the future if any built-in models starts to handle multiple outputs :
+        # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4474
+        assert len(result) == 1 or isinstance(
+            self.model, QuantizedModule
+        ), "Only 'QuantizedModule' instances can handle multi-outputs."
 
-        return deserialized_decrypted_dequantized_result
+        # In training mode, note that this step does not make much sense for now. Still, nothing
+        # breaks since QuantizedModule don't do anything in post-processing
+        result_post_processed = self.model.post_processing(*result)
+
+        return result_post_processed

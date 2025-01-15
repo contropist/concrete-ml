@@ -78,14 +78,14 @@ Once you're satisfied with the model's performance, you can compile it to the FH
 <!--pytest-codeblocks:skip-->
 
 ```bash
-python3 evaluation_one_example_fhe.py
+python3 evaluate_one_example_fhe.py
 ```
 
 Here, an image from the CIFAR10 data-set is randomly chosen and preprocessed. The data is then quantized, encrypted and then given to the FHE circuit that evaluates the encrypted image. The result, encrypted as well, is then decrypted and compared vs. the expected output coming from the clear inference.
 
 ## Hardware Used for the Experiment
 
-Experiments were conducted on an m6i.metal machine offering 128 CPU cores and 512GB of memory. The choice of hardware can significantly influence the execution time and performance of the model.
+Experiments were conducted on an m6i.metal machine offering 128 CPU cores and 512GB of memory. The choice of hardware can significantly influence the execution time of the model.
 
 ## Accuracy and performance
 
@@ -98,7 +98,7 @@ Experiments were conducted on an m6i.metal machine offering 128 CPU cores and 51
 | VGG FHE (simulation\*) | 6 bits   | 86.0     |
 | VGG FHE                | 6 bits   | 86.0\*\* |
 
-We ran the FHE inference over 10 examples and achieved 100% similar predictions between the simulation and FHE. The overall accuracy for the entire data-set is expected to match the simulation. The original model (no rounding) with a maximum of 13 bits of precision runs in around 9 hours on the specified hardware. Using the rounding approach, the final model ran in **4 minutes**. This significant performance improvement demonstrates the benefits of the rounding operator in the FHE setting.
+We ran the FHE inference over 10 examples and achieved 100% similar predictions between the simulation and FHE. The overall accuracy for the entire data-set is expected to match the simulation. The original model (no rounding) with a maximum of 13 bits of precision runs in around 9 hours on the specified hardware. Using the rounding approach, the final model ran in **40 seconds**. This significant performance improvement demonstrates the benefits of the rounding operator in the FHE setting.
 
 \* Simulation is used to evaluate the accuracy in the clear for faster debugging.
 \*\* We ran the FHE inference over 10 examples and got 100% similar predictions between the simulation and FHE. The overall accuracy for the entire data-set is expected to match the simulation.

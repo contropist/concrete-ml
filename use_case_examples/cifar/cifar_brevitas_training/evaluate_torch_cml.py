@@ -1,6 +1,7 @@
 import argparse
 from pathlib import Path
 
+import concrete.compiler
 import numpy as np
 import torch
 from concrete.fhe import Configuration
@@ -74,8 +75,14 @@ def main(args):
     # observe a decrease in torch's top1 accuracy when using MPS devices
     # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/3953
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    compilation_device = "cuda" if concrete.compiler.check_gpu_available() else "cpu"
 
-    print("Device in use:", device)
+    print("Torch device in use:", device)
+    print(
+        "To leverage the CUDA backend, follow the GPU setup guide to install the Concrete ML compiler."
+    )
+    print("GPU Enabled:", concrete.compiler.check_gpu_enabled())
+    print("GPU Available:", concrete.compiler.check_gpu_available())
 
     # Find relative path to this file
     dir_path = Path(__file__).parent.absolute()
@@ -118,7 +125,12 @@ def main(args):
             input_set,
             n_bits={"model_inputs": 8, "model_outputs": 8},
             configuration=cfg,
-            rounding_threshold_bits=rounding_threshold_bits,
+            rounding_threshold_bits=(
+                {"n_bits": rounding_threshold_bits, "method": "APPROXIMATE"}
+                if rounding_threshold_bits is not None
+                else None
+            ),
+            device=compilation_device,
         )
 
         # Print max bit-width in the circuit
@@ -137,7 +149,7 @@ if __name__ == "__main__":
         "--rounding_threshold_bits",
         nargs="+",
         type=int,
-        default=[None],
+        default=[6],
         help="Number of bits to target with rounding.",
     )
     parser.add_argument(

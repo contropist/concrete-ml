@@ -1,13 +1,11 @@
 """Tests for the sklearn decision trees."""
 
-
 import warnings
 from functools import partial
 
 import numpy
 import onnx
 import pytest
-from sklearn.exceptions import ConvergenceWarning
 
 from concrete.ml.common.utils import is_model_class_in_a_list
 from concrete.ml.pytest.utils import UNIQUE_MODELS_AND_DATASETS, get_model_name
@@ -20,14 +18,395 @@ from concrete.ml.sklearn.qnn import NeuralNetClassifier, NeuralNetRegressor
 # pylint: disable=line-too-long
 
 
-def check_onnx_file_dump(model_class, parameters, load_data, str_expected, default_configuration):
+def check_onnx_file_dump(
+    model_class, parameters, load_data, default_configuration, use_fhe_sum=False
+):
     """Fit the model and dump the corresponding ONNX."""
 
-    # Get the data-set. The data generation is seeded in load_data.
-    x, y = load_data(model_class, **parameters)
+    model_name = get_model_name(model_class)
+    n_classes = parameters.get("n_classes", 2)
 
     # Set the model
     model = model_class()
+
+    # Set `_fhe_ensembling` for tree based models only
+    if model_class in _get_sklearn_tree_models():
+
+        # pylint: disable=protected-access
+        model._fhe_ensembling = use_fhe_sum
+
+    # Ignore long lines here
+    # ruff: noqa: E501
+    expected_strings = {
+        "LinearSVC": """graph main_graph (
+  %input_0[DOUBLE, symx10]
+) initializers (
+  %_operators.0.coefficients[FLOAT, 10x1]
+  %_operators.0.intercepts[FLOAT, 1]
+) {
+  %/_operators.0/Gemm_output_0 = Gemm[alpha = 1, beta = 1](%input_0, %_operators.0.coefficients, %_operators.0.intercepts)
+  return %/_operators.0/Gemm_output_0
+}""",
+        "NeuralNetClassifier": """graph main_graph (
+  %x.197[FLOAT, 1x10]
+) initializers (
+  %features.fc0.bias[FLOAT, 40]
+  %features.fc1.bias[FLOAT, 40]
+  """
+        + f"%features.fc2.bias[FLOAT, {n_classes}]"
+        + """
+  %/features/quant0/act_quant/export_handler/Constant_output_0[FLOAT, scalar]
+  %/features/quant0/act_quant/export_handler/Constant_1_output_0[FLOAT, scalar]
+  %/features/quant0/act_quant/export_handler/Constant_2_output_0[FLOAT, scalar]
+  %/features/fc0/weight_quant/export_handler/Constant_output_0[FLOAT, 40x10]
+  %/features/fc0/weight_quant/export_handler/Constant_1_output_0[FLOAT, scalar]
+  %/features/quant1/act_quant/export_handler/Constant_output_0[FLOAT, scalar]
+  %/features/fc1/weight_quant/export_handler/Constant_output_0[FLOAT, 40x40]
+  %/features/fc1/weight_quant/export_handler/Constant_1_output_0[FLOAT, scalar]
+  %/features/quant2/act_quant/export_handler/Constant_output_0[FLOAT, scalar]
+  """
+        + f"%/features/fc2/weight_quant/export_handler/Constant_output_0[FLOAT, {n_classes}x40]"
+        + """
+  %/features/fc2/weight_quant/export_handler/Constant_1_output_0[FLOAT, scalar]
+) {
+  %/features/quant0/act_quant/export_handler/Quant_output_0 = Quant[narrow = 0, rounding_mode = 'ROUND', signed = 1](%x.197, %/features/quant0/act_quant/export_handler/Constant_1_output_0, %/features/quant0/act_quant/export_handler/Constant_2_output_0, %/features/quant0/act_quant/export_handler/Constant_output_0)
+  %/features/fc0/weight_quant/export_handler/Quant_output_0 = Quant[narrow = 1, rounding_mode = 'ROUND', signed = 0](%/features/fc0/weight_quant/export_handler/Constant_output_0, %/features/fc0/weight_quant/export_handler/Constant_1_output_0, %/features/quant0/act_quant/export_handler/Constant_2_output_0, %/features/quant0/act_quant/export_handler/Constant_output_0)
+  %/features/fc0/Gemm_output_0 = Gemm[alpha = 1, beta = 1, transB = 1](%/features/quant0/act_quant/export_handler/Quant_output_0, %/features/fc0/weight_quant/export_handler/Quant_output_0, %features.fc0.bias)
+  %/features/act0/Relu_output_0 = Relu(%/features/fc0/Gemm_output_0)
+  %/features/quant1/act_quant/export_handler/Quant_output_0 = Quant[narrow = 0, rounding_mode = 'ROUND', signed = 1](%/features/act0/Relu_output_0, %/features/quant1/act_quant/export_handler/Constant_output_0, %/features/quant0/act_quant/export_handler/Constant_2_output_0, %/features/quant0/act_quant/export_handler/Constant_output_0)
+  %/features/fc1/weight_quant/export_handler/Quant_output_0 = Quant[narrow = 1, rounding_mode = 'ROUND', signed = 0](%/features/fc1/weight_quant/export_handler/Constant_output_0, %/features/fc1/weight_quant/export_handler/Constant_1_output_0, %/features/quant0/act_quant/export_handler/Constant_2_output_0, %/features/quant0/act_quant/export_handler/Constant_output_0)
+  %/features/fc1/Gemm_output_0 = Gemm[alpha = 1, beta = 1, transB = 1](%/features/quant1/act_quant/export_handler/Quant_output_0, %/features/fc1/weight_quant/export_handler/Quant_output_0, %features.fc1.bias)
+  %/features/act1/Relu_output_0 = Relu(%/features/fc1/Gemm_output_0)
+  %/features/quant2/act_quant/export_handler/Quant_output_0 = Quant[narrow = 0, rounding_mode = 'ROUND', signed = 1](%/features/act1/Relu_output_0, %/features/quant2/act_quant/export_handler/Constant_output_0, %/features/quant0/act_quant/export_handler/Constant_2_output_0, %/features/quant0/act_quant/export_handler/Constant_output_0)
+  %/features/fc2/weight_quant/export_handler/Quant_output_0 = Quant[narrow = 1, rounding_mode = 'ROUND', signed = 0](%/features/fc2/weight_quant/export_handler/Constant_output_0, %/features/fc2/weight_quant/export_handler/Constant_1_output_0, %/features/quant0/act_quant/export_handler/Constant_2_output_0, %/features/quant0/act_quant/export_handler/Constant_output_0)
+  %31 = Gemm[alpha = 1, beta = 1, transB = 1](%/features/quant2/act_quant/export_handler/Quant_output_0, %/features/fc2/weight_quant/export_handler/Quant_output_0, %features.fc2.bias)
+  return %31
+}""",
+        "NeuralNetRegressor": """graph main_graph (
+  %x.197[FLOAT, 1x10]
+) initializers (
+  %features.fc0.bias[FLOAT, 10]
+  %features.fc1.bias[FLOAT, 10]
+  %features.fc2.bias[FLOAT, 1]
+  %/features/quant0/act_quant/export_handler/Constant_output_0[FLOAT, scalar]
+  %/features/quant0/act_quant/export_handler/Constant_1_output_0[FLOAT, scalar]
+  %/features/quant0/act_quant/export_handler/Constant_2_output_0[FLOAT, scalar]
+  %/features/fc0/weight_quant/export_handler/Constant_output_0[FLOAT, 10x10]
+  %/features/fc0/weight_quant/export_handler/Constant_1_output_0[FLOAT, scalar]
+  %/features/quant1/act_quant/export_handler/Constant_output_0[FLOAT, scalar]
+  %/features/fc1/weight_quant/export_handler/Constant_output_0[FLOAT, 10x10]
+  %/features/fc1/weight_quant/export_handler/Constant_1_output_0[FLOAT, scalar]
+  %/features/quant2/act_quant/export_handler/Constant_output_0[FLOAT, scalar]
+  %/features/fc2/weight_quant/export_handler/Constant_output_0[FLOAT, 1x10]
+  %/features/fc2/weight_quant/export_handler/Constant_1_output_0[FLOAT, scalar]
+) {
+  %/features/quant0/act_quant/export_handler/Quant_output_0 = Quant[narrow = 0, rounding_mode = 'ROUND', signed = 1](%x.197, %/features/quant0/act_quant/export_handler/Constant_1_output_0, %/features/quant0/act_quant/export_handler/Constant_2_output_0, %/features/quant0/act_quant/export_handler/Constant_output_0)
+  %/features/fc0/weight_quant/export_handler/Quant_output_0 = Quant[narrow = 1, rounding_mode = 'ROUND', signed = 0](%/features/fc0/weight_quant/export_handler/Constant_output_0, %/features/fc0/weight_quant/export_handler/Constant_1_output_0, %/features/quant0/act_quant/export_handler/Constant_2_output_0, %/features/quant0/act_quant/export_handler/Constant_output_0)
+  %/features/fc0/Gemm_output_0 = Gemm[alpha = 1, beta = 1, transB = 1](%/features/quant0/act_quant/export_handler/Quant_output_0, %/features/fc0/weight_quant/export_handler/Quant_output_0, %features.fc0.bias)
+  %/features/act0/Relu_output_0 = Relu(%/features/fc0/Gemm_output_0)
+  %/features/quant1/act_quant/export_handler/Quant_output_0 = Quant[narrow = 0, rounding_mode = 'ROUND', signed = 1](%/features/act0/Relu_output_0, %/features/quant1/act_quant/export_handler/Constant_output_0, %/features/quant0/act_quant/export_handler/Constant_2_output_0, %/features/quant0/act_quant/export_handler/Constant_output_0)
+  %/features/fc1/weight_quant/export_handler/Quant_output_0 = Quant[narrow = 1, rounding_mode = 'ROUND', signed = 0](%/features/fc1/weight_quant/export_handler/Constant_output_0, %/features/fc1/weight_quant/export_handler/Constant_1_output_0, %/features/quant0/act_quant/export_handler/Constant_2_output_0, %/features/quant0/act_quant/export_handler/Constant_output_0)
+  %/features/fc1/Gemm_output_0 = Gemm[alpha = 1, beta = 1, transB = 1](%/features/quant1/act_quant/export_handler/Quant_output_0, %/features/fc1/weight_quant/export_handler/Quant_output_0, %features.fc1.bias)
+  %/features/act1/Relu_output_0 = Relu(%/features/fc1/Gemm_output_0)
+  %/features/quant2/act_quant/export_handler/Quant_output_0 = Quant[narrow = 0, rounding_mode = 'ROUND', signed = 1](%/features/act1/Relu_output_0, %/features/quant2/act_quant/export_handler/Constant_output_0, %/features/quant0/act_quant/export_handler/Constant_2_output_0, %/features/quant0/act_quant/export_handler/Constant_output_0)
+  %/features/fc2/weight_quant/export_handler/Quant_output_0 = Quant[narrow = 1, rounding_mode = 'ROUND', signed = 0](%/features/fc2/weight_quant/export_handler/Constant_output_0, %/features/fc2/weight_quant/export_handler/Constant_1_output_0, %/features/quant0/act_quant/export_handler/Constant_2_output_0, %/features/quant0/act_quant/export_handler/Constant_output_0)
+  %31 = Gemm[alpha = 1, beta = 1, transB = 1](%/features/quant2/act_quant/export_handler/Quant_output_0, %/features/fc2/weight_quant/export_handler/Quant_output_0, %features.fc2.bias)
+  return %31
+}""",
+        "LogisticRegression": """graph main_graph (
+  %input_0[DOUBLE, symx10]
+) initializers (
+  %_operators.0.coefficients[FLOAT, 10x1]
+  %_operators.0.intercepts[FLOAT, 1]
+) {
+  %/_operators.0/Gemm_output_0 = Gemm[alpha = 1, beta = 1](%input_0, %_operators.0.coefficients, %_operators.0.intercepts)
+  return %/_operators.0/Gemm_output_0
+}""",
+        "DecisionTreeRegressor": """graph main_graph (
+  %input_0[DOUBLE, symx10]
+) {
+  %/_operators.0/Gemm_output_0 = Gemm[alpha = 1, beta = 0, transB = 1](%_operators.0.weight_1, %input_0)
+  %/_operators.0/LessOrEqual_output_0 = LessOrEqual(%/_operators.0/Gemm_output_0, %_operators.0.bias_1)
+  %/_operators.0/Reshape_output_0 = Reshape[allowzero = 0](%/_operators.0/LessOrEqual_output_0, %/_operators.0/Constant_output_0)
+  %/_operators.0/MatMul_output_0 = MatMul(%_operators.0.weight_2, %/_operators.0/Reshape_output_0)
+  %/_operators.0/Reshape_1_output_0 = Reshape[allowzero = 0](%/_operators.0/MatMul_output_0, %/_operators.0/Constant_1_output_0)
+  %/_operators.0/Equal_output_0 = Equal(%_operators.0.bias_2, %/_operators.0/Reshape_1_output_0)
+  %/_operators.0/Reshape_2_output_0 = Reshape[allowzero = 0](%/_operators.0/Equal_output_0, %/_operators.0/Constant_2_output_0)
+  %/_operators.0/MatMul_1_output_0 = MatMul(%_operators.0.weight_3, %/_operators.0/Reshape_2_output_0)
+  %/_operators.0/Reshape_3_output_0 = Reshape[allowzero = 0](%/_operators.0/MatMul_1_output_0, %/_operators.0/Constant_3_output_0)
+  """
+        + (
+            """%/_operators.0/ReduceSum_output_0 = ReduceSum[keepdims = 0](%/_operators.0/Reshape_3_output_0, %onnx::ReduceSum_22)
+  %transposed_output = Transpose[perm = [1, 0]](%/_operators.0/ReduceSum_output_0)
+  """
+            if use_fhe_sum
+            else "%transposed_output = Transpose[perm = [2, 1, 0]](%/_operators.0/Reshape_3_output_0)\n  "
+        )
+        + """return %transposed_output
+}""",
+        "RandomForestClassifier": """graph main_graph (
+  %input_0[DOUBLE, symx10]
+) {
+  %/_operators.0/Gemm_output_0 = Gemm[alpha = 1, beta = 0, transB = 1](%_operators.0.weight_1, %input_0)
+  %/_operators.0/LessOrEqual_output_0 = LessOrEqual(%/_operators.0/Gemm_output_0, %_operators.0.bias_1)
+  %/_operators.0/Constant_output_0 = Constant[value = <Tensor>]()
+  %/_operators.0/Reshape_output_0 = Reshape[allowzero = 0](%/_operators.0/LessOrEqual_output_0, %/_operators.0/Constant_output_0)
+  %/_operators.0/MatMul_output_0 = MatMul(%_operators.0.weight_2, %/_operators.0/Reshape_output_0)
+  %/_operators.0/Constant_1_output_0 = Constant[value = <Tensor>]()
+  %/_operators.0/Reshape_1_output_0 = Reshape[allowzero = 0](%/_operators.0/MatMul_output_0, %/_operators.0/Constant_1_output_0)
+  %/_operators.0/Equal_output_0 = Equal(%_operators.0.bias_2, %/_operators.0/Reshape_1_output_0)
+  %/_operators.0/Constant_2_output_0 = Constant[value = <Tensor>]()
+  %/_operators.0/Reshape_2_output_0 = Reshape[allowzero = 0](%/_operators.0/Equal_output_0, %/_operators.0/Constant_2_output_0)
+  %/_operators.0/MatMul_1_output_0 = MatMul(%_operators.0.weight_3, %/_operators.0/Reshape_2_output_0)
+  %/_operators.0/Constant_3_output_0 = Constant[value = <Tensor>]()
+  %/_operators.0/Reshape_3_output_0 = Reshape[allowzero = 0](%/_operators.0/MatMul_1_output_0, %/_operators.0/Constant_3_output_0)
+  %transposed_output = Transpose[perm = [2, 1, 0]](%/_operators.0/Reshape_3_output_0)
+  return %transposed_output
+}""",
+        "PoissonRegressor": """graph main_graph (
+  %input_0[DOUBLE, symx10]
+) initializers (
+  %_operators.0.coefficients[FLOAT, 10x1]
+  %_operators.0.intercepts[FLOAT, 1]
+) {
+  %/_operators.0/Gemm_output_0 = Gemm[alpha = 1, beta = 1](%input_0, %_operators.0.coefficients, %_operators.0.intercepts)
+  return %/_operators.0/Gemm_output_0
+}""",
+        "TweedieRegressor": [
+            """graph main_graph (
+  %input_0[DOUBLE, symx10]
+) initializers (
+  %_operators.0.coefficients[FLOAT, 10x1]
+  %_operators.0.intercepts[FLOAT, 1]
+) {
+  %/_operators.0/Gemm_output_0 = Gemm[alpha = 1, beta = 1](%input_0, %_operators.0.coefficients, %_operators.0.intercepts)
+  return %/_operators.0/Gemm_output_0
+}""",
+            """graph main_graph (
+  %input_0[DOUBLE, symx10]
+) initializers (
+  %_operators.0.coefficients[FLOAT, 10x1]
+  %_operators.0.intercepts[FLOAT, 1]
+) {
+  %variable = Gemm[alpha = 1, beta = 1](%input_0, %_operators.0.coefficients, %_operators.0.intercepts)
+  return %variable
+}""",
+        ],
+        "Ridge": """graph main_graph (
+  %input_0[DOUBLE, symx10]
+) initializers (
+  %_operators.0.coefficients[FLOAT, 10x1]
+  %_operators.0.intercepts[FLOAT, 1]
+) {
+  %variable = Gemm[alpha = 1, beta = 1](%input_0, %_operators.0.coefficients, %_operators.0.intercepts)
+  return %variable
+}""",
+        "DecisionTreeClassifier": """graph main_graph (
+  %input_0[DOUBLE, symx10]
+) {
+  %/_operators.0/Gemm_output_0 = Gemm[alpha = 1, beta = 0, transB = 1](%_operators.0.weight_1, %input_0)
+  %/_operators.0/LessOrEqual_output_0 = LessOrEqual(%/_operators.0/Gemm_output_0, %_operators.0.bias_1)
+  %/_operators.0/Reshape_output_0 = Reshape[allowzero = 0](%/_operators.0/LessOrEqual_output_0, %/_operators.0/Constant_output_0)
+  %/_operators.0/MatMul_output_0 = MatMul(%_operators.0.weight_2, %/_operators.0/Reshape_output_0)
+  %/_operators.0/Reshape_1_output_0 = Reshape[allowzero = 0](%/_operators.0/MatMul_output_0, %/_operators.0/Constant_1_output_0)
+  %/_operators.0/Equal_output_0 = Equal(%_operators.0.bias_2, %/_operators.0/Reshape_1_output_0)
+  %/_operators.0/Reshape_2_output_0 = Reshape[allowzero = 0](%/_operators.0/Equal_output_0, %/_operators.0/Constant_2_output_0)
+  %/_operators.0/MatMul_1_output_0 = MatMul(%_operators.0.weight_3, %/_operators.0/Reshape_2_output_0)
+  %/_operators.0/Reshape_3_output_0 = Reshape[allowzero = 0](%/_operators.0/MatMul_1_output_0, %/_operators.0/Constant_3_output_0)
+  """
+        + (
+            """%/_operators.0/ReduceSum_output_0 = ReduceSum[keepdims = 0](%/_operators.0/Reshape_3_output_0, %onnx::ReduceSum_22)
+  %transposed_output = Transpose[perm = [1, 0]](%/_operators.0/ReduceSum_output_0)
+  """
+            if use_fhe_sum is True
+            else "%transposed_output = Transpose[perm = [2, 1, 0]](%/_operators.0/Reshape_3_output_0)\n  "
+        )
+        + """return %transposed_output
+}""",
+        "GammaRegressor": """graph main_graph (
+  %input_0[DOUBLE, symx10]
+) initializers (
+  %_operators.0.coefficients[FLOAT, 10x1]
+  %_operators.0.intercepts[FLOAT, 1]
+) {
+  %/_operators.0/Gemm_output_0 = Gemm[alpha = 1, beta = 1](%input_0, %_operators.0.coefficients, %_operators.0.intercepts)
+  return %/_operators.0/Gemm_output_0
+}""",
+        "ElasticNet": """graph main_graph (
+  %input_0[DOUBLE, symx10]
+) initializers (
+  %_operators.0.coefficients[FLOAT, 10x1]
+  %_operators.0.intercepts[FLOAT, 1]
+) {
+  %variable = Gemm[alpha = 1, beta = 1](%input_0, %_operators.0.coefficients, %_operators.0.intercepts)
+  return %variable
+}""",
+        "LinearSVR": """graph main_graph (
+  %input_0[DOUBLE, symx10]
+) initializers (
+  %_operators.0.coefficients[FLOAT, 10x1]
+  %_operators.0.intercepts[FLOAT, 1]
+) {
+  %variable = Gemm[alpha = 1, beta = 1](%input_0, %_operators.0.coefficients, %_operators.0.intercepts)
+  return %variable
+}""",
+        "XGBClassifier": """graph main_graph (
+  %input_0[DOUBLE, symx10]
+) {
+  %/_operators.0/Gemm_output_0 = Gemm[alpha = 1, beta = 0, transB = 1](%_operators.0.weight_1, %input_0)
+  %/_operators.0/Less_output_0 = Less(%/_operators.0/Gemm_output_0, %_operators.0.bias_1)
+  %/_operators.0/Reshape_output_0 = Reshape[allowzero = 0](%/_operators.0/Less_output_0, %/_operators.0/Constant_output_0)
+  %/_operators.0/MatMul_output_0 = MatMul(%_operators.0.weight_2, %/_operators.0/Reshape_output_0)
+  %/_operators.0/Reshape_1_output_0 = Reshape[allowzero = 0](%/_operators.0/MatMul_output_0, %/_operators.0/Constant_1_output_0)
+  %/_operators.0/Equal_output_0 = Equal(%_operators.0.bias_2, %/_operators.0/Reshape_1_output_0)
+  %/_operators.0/Reshape_2_output_0 = Reshape[allowzero = 0](%/_operators.0/Equal_output_0, %/_operators.0/Constant_2_output_0)
+  %/_operators.0/MatMul_1_output_0 = MatMul(%_operators.0.weight_3, %/_operators.0/Reshape_2_output_0)
+  %/_operators.0/Reshape_3_output_0 = Reshape[allowzero = 0](%/_operators.0/MatMul_1_output_0, %/_operators.0/Constant_3_output_0)
+  %/_operators.0/Squeeze_output_0 = Squeeze(%/_operators.0/Reshape_3_output_0, %axes_squeeze)
+  %/_operators.0/Transpose_output_0 = Transpose[perm = [1, 0]](%/_operators.0/Squeeze_output_0)
+  %/_operators.0/Reshape_4_output_0 = Reshape[allowzero = 0](%/_operators.0/Transpose_output_0, %/_operators.0/Constant_4_output_0)
+  """
+        + (
+            """%/_operators.0/ReduceSum_output_0 = ReduceSum[keepdims = 0](%/_operators.0/Reshape_4_output_0, %onnx::ReduceSum_26)
+  return %/_operators.0/ReduceSum_output_0
+}"""
+            if use_fhe_sum is True
+            else "return %/_operators.0/Reshape_4_output_0\n}"
+        ),
+        "RandomForestRegressor": """graph main_graph (
+  %input_0[DOUBLE, symx10]
+) {
+  %/_operators.0/Gemm_output_0 = Gemm[alpha = 1, beta = 0, transB = 1](%_operators.0.weight_1, %input_0)
+  %/_operators.0/LessOrEqual_output_0 = LessOrEqual(%/_operators.0/Gemm_output_0, %_operators.0.bias_1)
+  %/_operators.0/Constant_output_0 = Constant[value = <Tensor>]()
+  %/_operators.0/Reshape_output_0 = Reshape[allowzero = 0](%/_operators.0/LessOrEqual_output_0, %/_operators.0/Constant_output_0)
+  %/_operators.0/MatMul_output_0 = MatMul(%_operators.0.weight_2, %/_operators.0/Reshape_output_0)
+  %/_operators.0/Constant_1_output_0 = Constant[value = <Tensor>]()
+  %/_operators.0/Reshape_1_output_0 = Reshape[allowzero = 0](%/_operators.0/MatMul_output_0, %/_operators.0/Constant_1_output_0)
+  %/_operators.0/Equal_output_0 = Equal(%_operators.0.bias_2, %/_operators.0/Reshape_1_output_0)
+  %/_operators.0/Constant_2_output_0 = Constant[value = <Tensor>]()
+  %/_operators.0/Reshape_2_output_0 = Reshape[allowzero = 0](%/_operators.0/Equal_output_0, %/_operators.0/Constant_2_output_0)
+  %/_operators.0/MatMul_1_output_0 = MatMul(%_operators.0.weight_3, %/_operators.0/Reshape_2_output_0)
+  %/_operators.0/Constant_3_output_0 = Constant[value = <Tensor>]()
+  %/_operators.0/Reshape_3_output_0 = Reshape[allowzero = 0](%/_operators.0/MatMul_1_output_0, %/_operators.0/Constant_3_output_0)
+  """
+        + (
+            """%/_operators.0/ReduceSum_output_0 = ReduceSum[keepdims = 0](%/_operators.0/Reshape_3_output_0, %onnx::ReduceSum_22)
+  %transposed_output = Transpose[perm = [1, 0]](%/_operators.0/ReduceSum_output_0)
+  """
+            if use_fhe_sum is True
+            else "%transposed_output = Transpose[perm = [2, 1, 0]](%/_operators.0/Reshape_3_output_0)"
+        )
+        + """return %transposed_output
+}""",
+        "XGBRegressor": """graph main_graph (
+  %input_0[DOUBLE, symx10]
+) initializers (
+  %_operators.0.weight_1[INT64, 140x10]
+  %_operators.0.bias_1[INT64, 140x1]
+  %_operators.0.weight_2[INT64, 20x8x7]
+  %_operators.0.bias_2[INT64, 160x1]
+  %_operators.0.weight_3[INT64, 20x1x8]
+  %axes_squeeze[INT64, 1]
+  %/_operators.0/Constant_output_0[INT64, 3]
+  %/_operators.0/Constant_1_output_0[INT64, 2]
+  %/_operators.0/Constant_2_output_0[INT64, 3]
+  %/_operators.0/Constant_3_output_0[INT64, 3]
+  %/_operators.0/Constant_4_output_0[INT64, 3]"""
+        + ("\n  %onnx::ReduceSum_27[INT64, 1]" if use_fhe_sum is True else "")
+        + """
+) {
+  %/_operators.0/Gemm_output_0 = Gemm[alpha = 1, beta = 0, transB = 1](%_operators.0.weight_1, %input_0)
+  %/_operators.0/Less_output_0 = Less(%/_operators.0/Gemm_output_0, %_operators.0.bias_1)
+  %/_operators.0/Reshape_output_0 = Reshape[allowzero = 0](%/_operators.0/Less_output_0, %/_operators.0/Constant_output_0)
+  %/_operators.0/MatMul_output_0 = MatMul(%_operators.0.weight_2, %/_operators.0/Reshape_output_0)
+  %/_operators.0/Reshape_1_output_0 = Reshape[allowzero = 0](%/_operators.0/MatMul_output_0, %/_operators.0/Constant_1_output_0)
+  %/_operators.0/Equal_output_0 = Equal(%_operators.0.bias_2, %/_operators.0/Reshape_1_output_0)
+  %/_operators.0/Reshape_2_output_0 = Reshape[allowzero = 0](%/_operators.0/Equal_output_0, %/_operators.0/Constant_2_output_0)
+  %/_operators.0/MatMul_1_output_0 = MatMul(%_operators.0.weight_3, %/_operators.0/Reshape_2_output_0)
+  %/_operators.0/Reshape_3_output_0 = Reshape[allowzero = 0](%/_operators.0/MatMul_1_output_0, %/_operators.0/Constant_3_output_0)
+  %/_operators.0/Squeeze_output_0 = Squeeze(%/_operators.0/Reshape_3_output_0, %axes_squeeze)
+  %/_operators.0/Transpose_output_0 = Transpose[perm = [1, 0]](%/_operators.0/Squeeze_output_0)
+  %/_operators.0/Reshape_4_output_0 = Reshape[allowzero = 0](%/_operators.0/Transpose_output_0, %/_operators.0/Constant_4_output_0)
+  """
+        + (
+            """%/_operators.0/ReduceSum_output_0 = ReduceSum[keepdims = 0](%/_operators.0/Reshape_4_output_0, %onnx::ReduceSum_27)
+  return %/_operators.0/ReduceSum_output_0
+}"""
+            if use_fhe_sum is True
+            else """return %/_operators.0/Reshape_4_output_0\n}"""
+        ),
+        "LinearRegression": """graph main_graph (
+  %input_0[DOUBLE, symx10]
+) initializers (
+  %_operators.0.coefficients[FLOAT, 10x2]
+  %_operators.0.intercepts[FLOAT, 2]
+) {
+  %variable = Gemm[alpha = 1, beta = 1](%input_0, %_operators.0.coefficients, %_operators.0.intercepts)
+  return %variable
+}""",
+        "SGDRegressor": """graph main_graph (
+  %input_0[DOUBLE, symx10]
+) initializers (
+  %_operators.0.coefficients[FLOAT, 10x1]
+  %_operators.0.intercepts[FLOAT, 1]
+) {
+  %variable = Gemm[alpha = 1, beta = 1](%input_0, %_operators.0.coefficients, %_operators.0.intercepts)
+  return %variable
+}""",
+        "Lasso": """graph main_graph (
+  %input_0[DOUBLE, symx10]
+) initializers (
+  %_operators.0.coefficients[FLOAT, 10x1]
+  %_operators.0.intercepts[FLOAT, 1]
+) {
+  %variable = Gemm[alpha = 1, beta = 1](%input_0, %_operators.0.coefficients, %_operators.0.intercepts)
+  return %variable
+}""",
+        "KNeighborsClassifier": """graph main_graph (
+  %input_0[DOUBLE, symx2]
+) {
+  %/_operators.0/Constant_output_0 = Constant[value = <Tensor>]()
+  %/_operators.0/Unsqueeze_output_0 = Unsqueeze(%input_0, %/_operators.0/Constant_output_0)
+  %/_operators.0/Constant_1_output_0 = Constant[value = <Tensor>]()
+  %/_operators.0/Sub_output_0 = Sub(%/_operators.0/Unsqueeze_output_0, %onnx::Sub_46)
+  %/_operators.0/Constant_2_output_0 = Constant[value = <Scalar Tensor []>]()
+  %/_operators.0/Pow_output_0 = Pow(%/_operators.0/Sub_output_0, %/_operators.0/Constant_2_output_0)
+  %/_operators.0/Constant_3_output_0 = Constant[value = <Tensor>]()
+  %/_operators.0/ReduceSum_output_0 = ReduceSum[keepdims = 0, noop_with_empty_axes = 0](%/_operators.0/Pow_output_0, %/_operators.0/Constant_3_output_0)
+  %/_operators.0/Pow_1_output_0 = Pow(%/_operators.0/ReduceSum_output_0, %/_operators.0/Constant_1_output_0)
+  %/_operators.0/Constant_4_output_0 = Constant[value = <Tensor>]()
+  %/_operators.0/TopK_output_0, %/_operators.0/TopK_output_1 = TopK[axis = 1, largest = 0, sorted = 1](%/_operators.0/Pow_1_output_0, %/_operators.0/Constant_4_output_0)
+  %/_operators.0/Constant_5_output_0 = Constant[value = <Tensor>]()
+  %/_operators.0/Reshape_output_0 = Reshape[allowzero = 0](%/_operators.0/TopK_output_1, %/_operators.0/Constant_5_output_0)
+  %/_operators.0/Gather_output_0 = Gather[axis = 0](%_operators.0.train_labels, %/_operators.0/Reshape_output_0)
+  %/_operators.0/Shape_output_0 = Shape(%/_operators.0/TopK_output_1)
+  %/_operators.0/ConstantOfShape_output_0 = ConstantOfShape[value = <Tensor>](%/_operators.0/Shape_output_0)
+  %/_operators.0/Constant_6_output_0 = Constant[value = <Tensor>]()
+  %/_operators.0/Reshape_1_output_0 = Reshape[allowzero = 0](%/_operators.0/Gather_output_0, %/_operators.0/Constant_6_output_0)
+  %/_operators.0/Constant_7_output_0 = Constant[value = <Tensor>]()
+  %/_operators.0/ScatterElements_output_0 = ScatterElements[axis = 1](%/_operators.0/Constant_7_output_0, %/_operators.0/Reshape_1_output_0, %/_operators.0/ConstantOfShape_output_0)
+  %/_operators.0/Constant_8_output_0 = Constant[value = <Tensor>]()
+  %/_operators.0/Add_output_0 = Add(%/_operators.0/Constant_8_output_0, %/_operators.0/ScatterElements_output_0)
+  %onnx::ReduceSum_36 = Constant[value = <Tensor>]()
+  %/_operators.0/ReduceSum_1_output_0 = ReduceSum[keepdims = 1](%/_operators.0/Add_output_0, %onnx::ReduceSum_36)
+  %/_operators.0/Constant_9_output_0 = Constant[value = <Scalar Tensor []>]()
+  %/_operators.0/Equal_output_0 = Equal(%/_operators.0/ReduceSum_1_output_0, %/_operators.0/Constant_9_output_0)
+  %/_operators.0/Constant_10_output_0 = Constant[value = <Tensor>]()
+  %/_operators.0/Where_output_0 = Where(%/_operators.0/Equal_output_0, %/_operators.0/Constant_10_output_0, %/_operators.0/ReduceSum_1_output_0)
+  %/_operators.0/Constant_11_output_0 = Constant[value = <Scalar Tensor []>]()
+  %/_operators.0/Pow_2_output_0 = Pow(%/_operators.0/Where_output_0, %/_operators.0/Constant_11_output_0)
+  %onnx::ArgMax_44 = Mul(%/_operators.0/Pow_2_output_0, %/_operators.0/Add_output_0)
+  %variable = ArgMax[axis = 1, keepdims = 0, select_last_index = 0](%onnx::ArgMax_44)
+  return %variable, %onnx::ArgMax_44
+}""",
+        "SGDClassifier": "graph main_graph (\n  %input_0[DOUBLE, symx10]\n) initializers (\n  %_operators.0.coefficients[FLOAT, 10x1]\n  %_operators.0.intercepts[FLOAT, 1]\n) {\n  %/_operators.0/Gemm_output_0 = Gemm[alpha = 1, beta = 1](%input_0, %_operators.0.coefficients, %_operators.0.intercepts)\n  return %/_operators.0/Gemm_output_0\n}",
+    }
+
+    str_expected = expected_strings.get(model_name, "")
+
+    # Get the data-set. The data generation is seeded in load_data.
+    x, y = load_data(model_class, **parameters)
 
     model_params = model.get_params()
     if "random_state" in model_params:
@@ -35,16 +414,12 @@ def check_onnx_file_dump(model_class, parameters, load_data, str_expected, defau
 
         model.set_params(**model_params)
 
-    if get_model_name(model) == "KNeighborsClassifier":
+    if model_name == "KNeighborsClassifier":
         # KNN can only be compiled with small quantization bit numbers for now
         # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/3979
         model.n_bits = 2
 
-    with warnings.catch_warnings():
-        # Sometimes, we miss convergence, which is not a problem for our test
-        warnings.simplefilter("ignore", category=ConvergenceWarning)
-
-        model.fit(x, y)
+    model.fit(x, y)
 
     with warnings.catch_warnings():
         # Use FHE simulation to not have issues with precision
@@ -67,8 +442,8 @@ def check_onnx_file_dump(model_class, parameters, load_data, str_expected, defau
             del onnx_model.graph.initializer[0]
 
     str_model = onnx.helper.printable_graph(onnx_model.graph)
-    print(f"{model_name}:")
-    print(str_model)
+    print(f"\nCurrent {model_name=}:\n{str_model}")
+    print(f"\nExpected {model_name=}:\n{str_expected}")
 
     # Test equality when it does not depend on seeds
     # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/3266
@@ -121,330 +496,10 @@ def test_dump(
             callbacks="disable",
         )
 
-    n_classes = parameters.get("n_classes", 2)
+    check_onnx_file_dump(model_class, parameters, load_data, default_configuration)
 
-    # Ignore long lines here
-    # ruff: noqa: E501
-    expected_strings = {
-        "LinearSVC": """graph torch_jit (
-  %input_0[DOUBLE, symx10]
-) initializers (
-  %_operators.0.coefficients[FLOAT, 10x1]
-  %_operators.0.intercepts[FLOAT, 1]
-) {
-  %/_operators.0/Gemm_output_0 = Gemm[alpha = 1, beta = 1](%input_0, %_operators.0.coefficients, %_operators.0.intercepts)
-  return %/_operators.0/Gemm_output_0
-}""",
-        "NeuralNetClassifier": """graph torch_jit (
-  %inp.1[FLOAT, 1x10]
-) initializers (
-  %features.fc0.bias[FLOAT, 40]
-  %features.fc1.bias[FLOAT, 40]
-  """
-        + f"%features.fc2.bias[FLOAT, {n_classes}]"
-        + """
-  %/features/quant0/act_quant/export_handler/Constant_output_0[FLOAT, scalar]
-  %/features/quant0/act_quant/export_handler/Constant_1_output_0[FLOAT, scalar]
-  %/features/quant0/act_quant/export_handler/Constant_2_output_0[FLOAT, scalar]
-  %/features/fc0/weight_quant/export_handler/Constant_output_0[FLOAT, 40x10]
-  %/features/fc0/weight_quant/export_handler/Constant_1_output_0[FLOAT, scalar]
-  %/features/quant1/act_quant/export_handler/Constant_output_0[FLOAT, scalar]
-  %/features/fc1/weight_quant/export_handler/Constant_output_0[FLOAT, 40x40]
-  %/features/fc1/weight_quant/export_handler/Constant_1_output_0[FLOAT, scalar]
-  %/features/quant2/act_quant/export_handler/Constant_output_0[FLOAT, scalar]
-  """
-        + f"%/features/fc2/weight_quant/export_handler/Constant_output_0[FLOAT, {n_classes}x40]"
-        + """
-  %/features/fc2/weight_quant/export_handler/Constant_1_output_0[FLOAT, scalar]
-) {
-  %/features/quant0/act_quant/export_handler/Quant_output_0 = Quant[narrow = 0, rounding_mode = 'ROUND', signed = 1](%inp.1, %/features/quant0/act_quant/export_handler/Constant_1_output_0, %/features/quant0/act_quant/export_handler/Constant_2_output_0, %/features/quant0/act_quant/export_handler/Constant_output_0)
-  %/features/fc0/weight_quant/export_handler/Quant_output_0 = Quant[narrow = 0, rounding_mode = 'ROUND', signed = 1](%/features/fc0/weight_quant/export_handler/Constant_output_0, %/features/fc0/weight_quant/export_handler/Constant_1_output_0, %/features/quant0/act_quant/export_handler/Constant_2_output_0, %/features/quant0/act_quant/export_handler/Constant_output_0)
-  %/features/fc0/Gemm_output_0 = Gemm[alpha = 1, beta = 1, transB = 1](%/features/quant0/act_quant/export_handler/Quant_output_0, %/features/fc0/weight_quant/export_handler/Quant_output_0, %features.fc0.bias)
-  %/features/act0/Relu_output_0 = Relu(%/features/fc0/Gemm_output_0)
-  %/features/quant1/act_quant/export_handler/Quant_output_0 = Quant[narrow = 0, rounding_mode = 'ROUND', signed = 1](%/features/act0/Relu_output_0, %/features/quant1/act_quant/export_handler/Constant_output_0, %/features/quant0/act_quant/export_handler/Constant_2_output_0, %/features/quant0/act_quant/export_handler/Constant_output_0)
-  %/features/fc1/weight_quant/export_handler/Quant_output_0 = Quant[narrow = 0, rounding_mode = 'ROUND', signed = 1](%/features/fc1/weight_quant/export_handler/Constant_output_0, %/features/fc1/weight_quant/export_handler/Constant_1_output_0, %/features/quant0/act_quant/export_handler/Constant_2_output_0, %/features/quant0/act_quant/export_handler/Constant_output_0)
-  %/features/fc1/Gemm_output_0 = Gemm[alpha = 1, beta = 1, transB = 1](%/features/quant1/act_quant/export_handler/Quant_output_0, %/features/fc1/weight_quant/export_handler/Quant_output_0, %features.fc1.bias)
-  %/features/act1/Relu_output_0 = Relu(%/features/fc1/Gemm_output_0)
-  %/features/quant2/act_quant/export_handler/Quant_output_0 = Quant[narrow = 0, rounding_mode = 'ROUND', signed = 1](%/features/act1/Relu_output_0, %/features/quant2/act_quant/export_handler/Constant_output_0, %/features/quant0/act_quant/export_handler/Constant_2_output_0, %/features/quant0/act_quant/export_handler/Constant_output_0)
-  %/features/fc2/weight_quant/export_handler/Quant_output_0 = Quant[narrow = 0, rounding_mode = 'ROUND', signed = 1](%/features/fc2/weight_quant/export_handler/Constant_output_0, %/features/fc2/weight_quant/export_handler/Constant_1_output_0, %/features/quant0/act_quant/export_handler/Constant_2_output_0, %/features/quant0/act_quant/export_handler/Constant_output_0)
-  %31 = Gemm[alpha = 1, beta = 1, transB = 1](%/features/quant2/act_quant/export_handler/Quant_output_0, %/features/fc2/weight_quant/export_handler/Quant_output_0, %features.fc2.bias)
-  return %31
-}""",
-        "NeuralNetRegressor": """graph torch_jit (
-  %inp.1[FLOAT, 1x10]
-) initializers (
-  %features.fc0.bias[FLOAT, 10]
-  %features.fc1.bias[FLOAT, 10]
-  %features.fc2.bias[FLOAT, 1]
-  %/features/quant0/act_quant/export_handler/Constant_output_0[FLOAT, scalar]
-  %/features/quant0/act_quant/export_handler/Constant_1_output_0[FLOAT, scalar]
-  %/features/quant0/act_quant/export_handler/Constant_2_output_0[FLOAT, scalar]
-  %/features/fc0/weight_quant/export_handler/Constant_output_0[FLOAT, 10x10]
-  %/features/fc0/weight_quant/export_handler/Constant_1_output_0[FLOAT, scalar]
-  %/features/quant1/act_quant/export_handler/Constant_output_0[FLOAT, scalar]
-  %/features/fc1/weight_quant/export_handler/Constant_output_0[FLOAT, 10x10]
-  %/features/fc1/weight_quant/export_handler/Constant_1_output_0[FLOAT, scalar]
-  %/features/quant2/act_quant/export_handler/Constant_output_0[FLOAT, scalar]
-  %/features/fc2/weight_quant/export_handler/Constant_output_0[FLOAT, 1x10]
-  %/features/fc2/weight_quant/export_handler/Constant_1_output_0[FLOAT, scalar]
-) {
-  %/features/quant0/act_quant/export_handler/Quant_output_0 = Quant[narrow = 0, rounding_mode = 'ROUND', signed = 1](%inp.1, %/features/quant0/act_quant/export_handler/Constant_1_output_0, %/features/quant0/act_quant/export_handler/Constant_2_output_0, %/features/quant0/act_quant/export_handler/Constant_output_0)
-  %/features/fc0/weight_quant/export_handler/Quant_output_0 = Quant[narrow = 0, rounding_mode = 'ROUND', signed = 1](%/features/fc0/weight_quant/export_handler/Constant_output_0, %/features/fc0/weight_quant/export_handler/Constant_1_output_0, %/features/quant0/act_quant/export_handler/Constant_2_output_0, %/features/quant0/act_quant/export_handler/Constant_output_0)
-  %/features/fc0/Gemm_output_0 = Gemm[alpha = 1, beta = 1, transB = 1](%/features/quant0/act_quant/export_handler/Quant_output_0, %/features/fc0/weight_quant/export_handler/Quant_output_0, %features.fc0.bias)
-  %/features/act0/Relu_output_0 = Relu(%/features/fc0/Gemm_output_0)
-  %/features/quant1/act_quant/export_handler/Quant_output_0 = Quant[narrow = 0, rounding_mode = 'ROUND', signed = 1](%/features/act0/Relu_output_0, %/features/quant1/act_quant/export_handler/Constant_output_0, %/features/quant0/act_quant/export_handler/Constant_2_output_0, %/features/quant0/act_quant/export_handler/Constant_output_0)
-  %/features/fc1/weight_quant/export_handler/Quant_output_0 = Quant[narrow = 0, rounding_mode = 'ROUND', signed = 1](%/features/fc1/weight_quant/export_handler/Constant_output_0, %/features/fc1/weight_quant/export_handler/Constant_1_output_0, %/features/quant0/act_quant/export_handler/Constant_2_output_0, %/features/quant0/act_quant/export_handler/Constant_output_0)
-  %/features/fc1/Gemm_output_0 = Gemm[alpha = 1, beta = 1, transB = 1](%/features/quant1/act_quant/export_handler/Quant_output_0, %/features/fc1/weight_quant/export_handler/Quant_output_0, %features.fc1.bias)
-  %/features/act1/Relu_output_0 = Relu(%/features/fc1/Gemm_output_0)
-  %/features/quant2/act_quant/export_handler/Quant_output_0 = Quant[narrow = 0, rounding_mode = 'ROUND', signed = 1](%/features/act1/Relu_output_0, %/features/quant2/act_quant/export_handler/Constant_output_0, %/features/quant0/act_quant/export_handler/Constant_2_output_0, %/features/quant0/act_quant/export_handler/Constant_output_0)
-  %/features/fc2/weight_quant/export_handler/Quant_output_0 = Quant[narrow = 0, rounding_mode = 'ROUND', signed = 1](%/features/fc2/weight_quant/export_handler/Constant_output_0, %/features/fc2/weight_quant/export_handler/Constant_1_output_0, %/features/quant0/act_quant/export_handler/Constant_2_output_0, %/features/quant0/act_quant/export_handler/Constant_output_0)
-  %31 = Gemm[alpha = 1, beta = 1, transB = 1](%/features/quant2/act_quant/export_handler/Quant_output_0, %/features/fc2/weight_quant/export_handler/Quant_output_0, %features.fc2.bias)
-  return %31
-}""",
-        "LogisticRegression": """graph torch_jit (
-  %input_0[DOUBLE, symx10]
-) initializers (
-  %_operators.0.coefficients[FLOAT, 10x1]
-  %_operators.0.intercepts[FLOAT, 1]
-) {
-  %/_operators.0/Gemm_output_0 = Gemm[alpha = 1, beta = 1](%input_0, %_operators.0.coefficients, %_operators.0.intercepts)
-  return %/_operators.0/Gemm_output_0
-}""",
-        "DecisionTreeRegressor": """graph torch_jit (
-  %input_0[DOUBLE, symx10]
-) {
-  %/_operators.0/Gemm_output_0 = Gemm[alpha = 1, beta = 0, transB = 1](%_operators.0.weight_1, %input_0)
-  %/_operators.0/LessOrEqual_output_0 = LessOrEqual(%/_operators.0/Gemm_output_0, %_operators.0.bias_1)
-  %/_operators.0/Reshape_output_0 = Reshape[allowzero = 0](%/_operators.0/LessOrEqual_output_0, %/_operators.0/Constant_output_0)
-  %/_operators.0/MatMul_output_0 = MatMul(%_operators.0.weight_2, %/_operators.0/Reshape_output_0)
-  %/_operators.0/Reshape_1_output_0 = Reshape[allowzero = 0](%/_operators.0/MatMul_output_0, %/_operators.0/Constant_1_output_0)
-  %/_operators.0/Equal_output_0 = Equal(%_operators.0.bias_2, %/_operators.0/Reshape_1_output_0)
-  %/_operators.0/Reshape_2_output_0 = Reshape[allowzero = 0](%/_operators.0/Equal_output_0, %/_operators.0/Constant_2_output_0)
-  %/_operators.0/MatMul_1_output_0 = MatMul(%_operators.0.weight_3, %/_operators.0/Reshape_2_output_0)
-  %/_operators.0/Reshape_3_output_0 = Reshape[allowzero = 0](%/_operators.0/MatMul_1_output_0, %/_operators.0/Constant_3_output_0)
-  %transposed_output = Transpose[perm = [2, 1, 0]](%/_operators.0/Reshape_3_output_0)
-  return %transposed_output
-}""",
-        "RandomForestClassifier": """graph torch_jit (
-  %input_0[DOUBLE, symx10]
-) {
-  %/_operators.0/Gemm_output_0 = Gemm[alpha = 1, beta = 0, transB = 1](%_operators.0.weight_1, %input_0)
-  %/_operators.0/LessOrEqual_output_0 = LessOrEqual(%/_operators.0/Gemm_output_0, %_operators.0.bias_1)
-  %/_operators.0/Constant_output_0 = Constant[value = <Tensor>]()
-  %/_operators.0/Reshape_output_0 = Reshape[allowzero = 0](%/_operators.0/LessOrEqual_output_0, %/_operators.0/Constant_output_0)
-  %/_operators.0/MatMul_output_0 = MatMul(%_operators.0.weight_2, %/_operators.0/Reshape_output_0)
-  %/_operators.0/Constant_1_output_0 = Constant[value = <Tensor>]()
-  %/_operators.0/Reshape_1_output_0 = Reshape[allowzero = 0](%/_operators.0/MatMul_output_0, %/_operators.0/Constant_1_output_0)
-  %/_operators.0/Equal_output_0 = Equal(%_operators.0.bias_2, %/_operators.0/Reshape_1_output_0)
-  %/_operators.0/Constant_2_output_0 = Constant[value = <Tensor>]()
-  %/_operators.0/Reshape_2_output_0 = Reshape[allowzero = 0](%/_operators.0/Equal_output_0, %/_operators.0/Constant_2_output_0)
-  %/_operators.0/MatMul_1_output_0 = MatMul(%_operators.0.weight_3, %/_operators.0/Reshape_2_output_0)
-  %/_operators.0/Constant_3_output_0 = Constant[value = <Tensor>]()
-  %/_operators.0/Reshape_3_output_0 = Reshape[allowzero = 0](%/_operators.0/MatMul_1_output_0, %/_operators.0/Constant_3_output_0)
-  %transposed_output = Transpose[perm = [2, 1, 0]](%/_operators.0/Reshape_3_output_0)
-  return %transposed_output
-}""",
-        "PoissonRegressor": """graph torch_jit (
-  %input_0[DOUBLE, symx10]
-) initializers (
-  %_operators.0.coefficients[FLOAT, 10x1]
-  %_operators.0.intercepts[FLOAT, 1]
-) {
-  %/_operators.0/Gemm_output_0 = Gemm[alpha = 1, beta = 1](%input_0, %_operators.0.coefficients, %_operators.0.intercepts)
-  return %/_operators.0/Gemm_output_0
-}""",
-        "TweedieRegressor": [
-            """graph torch_jit (
-  %input_0[DOUBLE, symx10]
-) initializers (
-  %_operators.0.coefficients[FLOAT, 10x1]
-  %_operators.0.intercepts[FLOAT, 1]
-) {
-  %/_operators.0/Gemm_output_0 = Gemm[alpha = 1, beta = 1](%input_0, %_operators.0.coefficients, %_operators.0.intercepts)
-  return %/_operators.0/Gemm_output_0
-}""",
-            """graph torch_jit (
-  %input_0[DOUBLE, symx10]
-) initializers (
-  %_operators.0.coefficients[FLOAT, 10x1]
-  %_operators.0.intercepts[FLOAT, 1]
-) {
-  %variable = Gemm[alpha = 1, beta = 1](%input_0, %_operators.0.coefficients, %_operators.0.intercepts)
-  return %variable
-}""",
-        ],
-        "Ridge": """graph torch_jit (
-  %input_0[DOUBLE, symx10]
-) initializers (
-  %_operators.0.coefficients[FLOAT, 10x1]
-  %_operators.0.intercepts[FLOAT, 1]
-) {
-  %variable = Gemm[alpha = 1, beta = 1](%input_0, %_operators.0.coefficients, %_operators.0.intercepts)
-  return %variable
-}""",
-        "DecisionTreeClassifier": """graph torch_jit (
-  %input_0[DOUBLE, symx10]
-) {
-  %/_operators.0/Gemm_output_0 = Gemm[alpha = 1, beta = 0, transB = 1](%_operators.0.weight_1, %input_0)
-  %/_operators.0/LessOrEqual_output_0 = LessOrEqual(%/_operators.0/Gemm_output_0, %_operators.0.bias_1)
-  %/_operators.0/Reshape_output_0 = Reshape[allowzero = 0](%/_operators.0/LessOrEqual_output_0, %/_operators.0/Constant_output_0)
-  %/_operators.0/MatMul_output_0 = MatMul(%_operators.0.weight_2, %/_operators.0/Reshape_output_0)
-  %/_operators.0/Reshape_1_output_0 = Reshape[allowzero = 0](%/_operators.0/MatMul_output_0, %/_operators.0/Constant_1_output_0)
-  %/_operators.0/Equal_output_0 = Equal(%_operators.0.bias_2, %/_operators.0/Reshape_1_output_0)
-  %/_operators.0/Reshape_2_output_0 = Reshape[allowzero = 0](%/_operators.0/Equal_output_0, %/_operators.0/Constant_2_output_0)
-  %/_operators.0/MatMul_1_output_0 = MatMul(%_operators.0.weight_3, %/_operators.0/Reshape_2_output_0)
-  %/_operators.0/Reshape_3_output_0 = Reshape[allowzero = 0](%/_operators.0/MatMul_1_output_0, %/_operators.0/Constant_3_output_0)
-  %transposed_output = Transpose[perm = [2, 1, 0]](%/_operators.0/Reshape_3_output_0)
-  return %transposed_output
-}""",
-        "GammaRegressor": """graph torch_jit (
-  %input_0[DOUBLE, symx10]
-) initializers (
-  %_operators.0.coefficients[FLOAT, 10x1]
-  %_operators.0.intercepts[FLOAT, 1]
-) {
-  %/_operators.0/Gemm_output_0 = Gemm[alpha = 1, beta = 1](%input_0, %_operators.0.coefficients, %_operators.0.intercepts)
-  return %/_operators.0/Gemm_output_0
-}""",
-        "ElasticNet": """graph torch_jit (
-  %input_0[DOUBLE, symx10]
-) initializers (
-  %_operators.0.coefficients[FLOAT, 10x1]
-  %_operators.0.intercepts[FLOAT, 1]
-) {
-  %variable = Gemm[alpha = 1, beta = 1](%input_0, %_operators.0.coefficients, %_operators.0.intercepts)
-  return %variable
-}""",
-        "LinearSVR": """graph torch_jit (
-  %input_0[DOUBLE, symx10]
-) initializers (
-  %_operators.0.coefficients[FLOAT, 10x1]
-  %_operators.0.intercepts[FLOAT, 1]
-) {
-  %variable = Gemm[alpha = 1, beta = 1](%input_0, %_operators.0.coefficients, %_operators.0.intercepts)
-  return %variable
-}""",
-        "XGBClassifier": """graph torch_jit (
-  %input_0[DOUBLE, symx10]
-) {
-  %/_operators.0/Gemm_output_0 = Gemm[alpha = 1, beta = 0, transB = 1](%_operators.0.weight_1, %input_0)
-  %/_operators.0/Less_output_0 = Less(%/_operators.0/Gemm_output_0, %_operators.0.bias_1)
-  %/_operators.0/Reshape_output_0 = Reshape[allowzero = 0](%/_operators.0/Less_output_0, %/_operators.0/Constant_output_0)
-  %/_operators.0/MatMul_output_0 = MatMul(%_operators.0.weight_2, %/_operators.0/Reshape_output_0)
-  %/_operators.0/Reshape_1_output_0 = Reshape[allowzero = 0](%/_operators.0/MatMul_output_0, %/_operators.0/Constant_1_output_0)
-  %/_operators.0/Equal_output_0 = Equal(%_operators.0.bias_2, %/_operators.0/Reshape_1_output_0)
-  %/_operators.0/Reshape_2_output_0 = Reshape[allowzero = 0](%/_operators.0/Equal_output_0, %/_operators.0/Constant_2_output_0)
-  %/_operators.0/MatMul_1_output_0 = MatMul(%_operators.0.weight_3, %/_operators.0/Reshape_2_output_0)
-  %/_operators.0/Reshape_3_output_0 = Reshape[allowzero = 0](%/_operators.0/MatMul_1_output_0, %/_operators.0/Constant_3_output_0)
-  %/_operators.0/Squeeze_output_0 = Squeeze(%/_operators.0/Reshape_3_output_0, %axes_squeeze)
-  %/_operators.0/Transpose_output_0 = Transpose[perm = [1, 0]](%/_operators.0/Squeeze_output_0)
-  %/_operators.0/Reshape_4_output_0 = Reshape[allowzero = 0](%/_operators.0/Transpose_output_0, %/_operators.0/Constant_4_output_0)
-  return %/_operators.0/Reshape_4_output_0
-}""",
-        "RandomForestRegressor": """graph torch_jit (
-  %input_0[DOUBLE, symx10]
-) {
-  %/_operators.0/Gemm_output_0 = Gemm[alpha = 1, beta = 0, transB = 1](%_operators.0.weight_1, %input_0)
-  %/_operators.0/LessOrEqual_output_0 = LessOrEqual(%/_operators.0/Gemm_output_0, %_operators.0.bias_1)
-  %/_operators.0/Constant_output_0 = Constant[value = <Tensor>]()
-  %/_operators.0/Reshape_output_0 = Reshape[allowzero = 0](%/_operators.0/LessOrEqual_output_0, %/_operators.0/Constant_output_0)
-  %/_operators.0/MatMul_output_0 = MatMul(%_operators.0.weight_2, %/_operators.0/Reshape_output_0)
-  %/_operators.0/Constant_1_output_0 = Constant[value = <Tensor>]()
-  %/_operators.0/Reshape_1_output_0 = Reshape[allowzero = 0](%/_operators.0/MatMul_output_0, %/_operators.0/Constant_1_output_0)
-  %/_operators.0/Equal_output_0 = Equal(%_operators.0.bias_2, %/_operators.0/Reshape_1_output_0)
-  %/_operators.0/Constant_2_output_0 = Constant[value = <Tensor>]()
-  %/_operators.0/Reshape_2_output_0 = Reshape[allowzero = 0](%/_operators.0/Equal_output_0, %/_operators.0/Constant_2_output_0)
-  %/_operators.0/MatMul_1_output_0 = MatMul(%_operators.0.weight_3, %/_operators.0/Reshape_2_output_0)
-  %/_operators.0/Constant_3_output_0 = Constant[value = <Tensor>]()
-  %/_operators.0/Reshape_3_output_0 = Reshape[allowzero = 0](%/_operators.0/MatMul_1_output_0, %/_operators.0/Constant_3_output_0)
-  %transposed_output = Transpose[perm = [2, 1, 0]](%/_operators.0/Reshape_3_output_0)
-  return %transposed_output
-}""",
-        "XGBRegressor": """graph torch_jit (
-  %input_0[DOUBLE, symx10]
-) initializers (
-  %_operators.0.weight_1[INT64, 140x10]
-  %_operators.0.bias_1[INT64, 140x1]
-  %_operators.0.weight_2[INT64, 20x8x7]
-  %_operators.0.bias_2[INT64, 160x1]
-  %_operators.0.weight_3[INT64, 20x1x8]
-  %axes_squeeze[INT64, 1]
-  %/_operators.0/Constant_output_0[INT64, 3]
-  %/_operators.0/Constant_1_output_0[INT64, 2]
-  %/_operators.0/Constant_2_output_0[INT64, 3]
-  %/_operators.0/Constant_3_output_0[INT64, 3]
-  %/_operators.0/Constant_4_output_0[INT64, 3]
-) {
-  %/_operators.0/Gemm_output_0 = Gemm[alpha = 1, beta = 0, transB = 1](%_operators.0.weight_1, %input_0)
-  %/_operators.0/Less_output_0 = Less(%/_operators.0/Gemm_output_0, %_operators.0.bias_1)
-  %/_operators.0/Reshape_output_0 = Reshape[allowzero = 0](%/_operators.0/Less_output_0, %/_operators.0/Constant_output_0)
-  %/_operators.0/MatMul_output_0 = MatMul(%_operators.0.weight_2, %/_operators.0/Reshape_output_0)
-  %/_operators.0/Reshape_1_output_0 = Reshape[allowzero = 0](%/_operators.0/MatMul_output_0, %/_operators.0/Constant_1_output_0)
-  %/_operators.0/Equal_output_0 = Equal(%_operators.0.bias_2, %/_operators.0/Reshape_1_output_0)
-  %/_operators.0/Reshape_2_output_0 = Reshape[allowzero = 0](%/_operators.0/Equal_output_0, %/_operators.0/Constant_2_output_0)
-  %/_operators.0/MatMul_1_output_0 = MatMul(%_operators.0.weight_3, %/_operators.0/Reshape_2_output_0)
-  %/_operators.0/Reshape_3_output_0 = Reshape[allowzero = 0](%/_operators.0/MatMul_1_output_0, %/_operators.0/Constant_3_output_0)
-  %/_operators.0/Squeeze_output_0 = Squeeze(%/_operators.0/Reshape_3_output_0, %axes_squeeze)
-  %/_operators.0/Transpose_output_0 = Transpose[perm = [1, 0]](%/_operators.0/Squeeze_output_0)
-  %/_operators.0/Reshape_4_output_0 = Reshape[allowzero = 0](%/_operators.0/Transpose_output_0, %/_operators.0/Constant_4_output_0)
-  return %/_operators.0/Reshape_4_output_0
-}""",
-        "LinearRegression": """graph torch_jit (
-  %input_0[DOUBLE, symx10]
-) initializers (
-  %_operators.0.coefficients[FLOAT, 10x2]
-  %_operators.0.intercepts[FLOAT, 2]
-) {
-  %variable = Gemm[alpha = 1, beta = 1](%input_0, %_operators.0.coefficients, %_operators.0.intercepts)
-  return %variable
-}""",
-        "Lasso": """graph torch_jit (
-  %input_0[DOUBLE, symx10]
-) initializers (
-  %_operators.0.coefficients[FLOAT, 10x1]
-  %_operators.0.intercepts[FLOAT, 1]
-) {
-  %variable = Gemm[alpha = 1, beta = 1](%input_0, %_operators.0.coefficients, %_operators.0.intercepts)
-  return %variable
-}""",
-        "KNeighborsClassifier": """graph torch_jit (
-  %input_0[DOUBLE, symx2]
-) {
-  %/_operators.0/Constant_output_0 = Constant[value = <Tensor>]()
-  %/_operators.0/Unsqueeze_output_0 = Unsqueeze(%input_0, %/_operators.0/Constant_output_0)
-  %/_operators.0/Constant_1_output_0 = Constant[value = <Tensor>]()
-  %/_operators.0/Sub_output_0 = Sub(%/_operators.0/Unsqueeze_output_0, %onnx::Sub_46)
-  %/_operators.0/Constant_2_output_0 = Constant[value = <Scalar Tensor []>]()
-  %/_operators.0/Pow_output_0 = Pow(%/_operators.0/Sub_output_0, %/_operators.0/Constant_2_output_0)
-  %/_operators.0/Constant_3_output_0 = Constant[value = <Tensor>]()
-  %/_operators.0/ReduceSum_output_0 = ReduceSum[keepdims = 0, noop_with_empty_axes = 0](%/_operators.0/Pow_output_0, %/_operators.0/Constant_3_output_0)
-  %/_operators.0/Pow_1_output_0 = Pow(%/_operators.0/ReduceSum_output_0, %/_operators.0/Constant_1_output_0)
-  %/_operators.0/Constant_4_output_0 = Constant[value = <Tensor>]()
-  %/_operators.0/TopK_output_0, %/_operators.0/TopK_output_1 = TopK[axis = 1, largest = 0, sorted = 1](%/_operators.0/Pow_1_output_0, %/_operators.0/Constant_4_output_0)
-  %/_operators.0/Constant_5_output_0 = Constant[value = <Tensor>]()
-  %/_operators.0/Reshape_output_0 = Reshape[allowzero = 0](%/_operators.0/TopK_output_1, %/_operators.0/Constant_5_output_0)
-  %/_operators.0/Gather_output_0 = Gather[axis = 0](%_operators.0.train_labels, %/_operators.0/Reshape_output_0)
-  %/_operators.0/Shape_output_0 = Shape(%/_operators.0/TopK_output_1)
-  %/_operators.0/ConstantOfShape_output_0 = ConstantOfShape[value = <Tensor>](%/_operators.0/Shape_output_0)
-  %/_operators.0/Constant_6_output_0 = Constant[value = <Tensor>]()
-  %/_operators.0/Reshape_1_output_0 = Reshape[allowzero = 0](%/_operators.0/Gather_output_0, %/_operators.0/Constant_6_output_0)
-  %/_operators.0/Constant_7_output_0 = Constant[value = <Tensor>]()
-  %/_operators.0/ScatterElements_output_0 = ScatterElements[axis = 1](%/_operators.0/Constant_7_output_0, %/_operators.0/Reshape_1_output_0, %/_operators.0/ConstantOfShape_output_0)
-  %/_operators.0/Constant_8_output_0 = Constant[value = <Tensor>]()
-  %/_operators.0/Add_output_0 = Add(%/_operators.0/Constant_8_output_0, %/_operators.0/ScatterElements_output_0)
-  %onnx::ReduceSum_36 = Constant[value = <Tensor>]()
-  %/_operators.0/ReduceSum_1_output_0 = ReduceSum[keepdims = 1](%/_operators.0/Add_output_0, %onnx::ReduceSum_36)
-  %/_operators.0/Constant_9_output_0 = Constant[value = <Scalar Tensor []>]()
-  %/_operators.0/Equal_output_0 = Equal(%/_operators.0/ReduceSum_1_output_0, %/_operators.0/Constant_9_output_0)
-  %/_operators.0/Constant_10_output_0 = Constant[value = <Tensor>]()
-  %/_operators.0/Where_output_0 = Where(%/_operators.0/Equal_output_0, %/_operators.0/Constant_10_output_0, %/_operators.0/ReduceSum_1_output_0)
-  %/_operators.0/Constant_11_output_0 = Constant[value = <Scalar Tensor []>]()
-  %/_operators.0/Pow_2_output_0 = Pow(%/_operators.0/Where_output_0, %/_operators.0/Constant_11_output_0)
-  %onnx::ArgMax_44 = Mul(%/_operators.0/Pow_2_output_0, %/_operators.0/Add_output_0)
-  %variable = ArgMax[axis = 1, keepdims = 0, select_last_index = 0](%onnx::ArgMax_44)
-  return %variable, %onnx::ArgMax_44
-}""",
-    }
-
-    str_expected = expected_strings[model_name]
-    check_onnx_file_dump(model_class, parameters, load_data, str_expected, default_configuration)
+    # Additional tests exclusively dedicated for tree ensemble models.
+    if model_class in _get_sklearn_tree_models():
+        check_onnx_file_dump(
+            model_class, parameters, load_data, default_configuration, use_fhe_sum=True
+        )

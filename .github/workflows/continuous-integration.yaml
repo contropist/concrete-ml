@@ -1,4 +1,4 @@
-name: CML builds (weekly or not)
+name: Concrete ML Tests
 on:
   pull_request:
 
@@ -6,47 +6,45 @@ on:
     branches:
       - main
       - 'release/*'
-  
+
   release:
     types: [published]
 
-  # Workflow dispatch and schedule refer to the weekly build
   workflow_dispatch:
     inputs:
       event_name:
         description: "Event that triggers the workflow"
         required: true
         type: choice
-        default: weekly
+        default: pr
         options:
-          - weekly
           - pr
-          - push_to_main
-          - push_to_release
 
       linux_python_versions:
-        description: "Space separated list of python versions (3.8, 3.9, 3.10 are supported) to launch on linux"
+        description: "Space separated list of python versions (3.8, 3.9, 3.10, 3.11, 3.12 are supported) to launch on linux"
         required: false
         type: string
-        default: "3.8 3.9"
+        default: "3.8"
+
       macos_python_versions:
-        description: "Space separated list of python versions (3.8, 3.9, 3.10 are supported) to launch on macos"
+        description: "Space separated list of python versions (3.8, 3.9, 3.10, 3.11, 3.12 are supported) to launch on macos (intel)"
         required: false
         type: string
-        default: "3.8 3.9"
+        default: "3.8"
+
       manual_call:
-        description: "Do not uncheck this"
+        description: "Do not uncheck this!"
         type: boolean
         required: false
         default: true
-  
-  # Workflow call refers to the release process (it enables the current CI workflow to be called by
-  # another workflow from the same repository, in this case the release one)
-  # The "release" event is not put by default in order to avoid running the following CI without
-  # explicitly indicating it in the caller workflow
+
+  # Workflow call refers to the weekly or release process (it enables the current CI workflow to be
+  # called by another workflow from the same repository, in this case the release one)
+  # No default value is put in order to avoid running the following CI without explicitly
+  # indicating it in the caller workflow
   # Besides, GitHub actions are not able to differentiate 'workflow_dispatch' from 'workflow_call'
-  # based on 'github.event_name' and both are set to 'workflow_dispatch'. Therefore, an optional 
-  # input 'manual_call' with proper default values is added to both as a workaround, following one 
+  # based on 'github.event_name' and both are set to 'workflow_dispatch'. Therefore, an optional
+  # input 'manual_call' with proper default values is added to both as a workaround, following one
   # user's suggestion : https://github.com/actions/runner/discussions/1884
   # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/3930
   workflow_call:
@@ -60,12 +58,6 @@ on:
         type: boolean
         required: false
         default: false
-  
-  schedule:
-    # * is a special character in YAML so you have to quote this string
-    # At 22:00 on Sunday
-    # Timezone is UTC, so Paris time is +2 during the summer and +1 during winter
-    - cron: '0 22 * * 0'
 
 concurrency:
   # Add event_name in the group as workflow dispatch means we could run this in addition to other
@@ -76,21 +68,23 @@ concurrency:
 
 env:
   ACTION_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-  # The CI can be triggered by the release workflow which itself can be triggered by the merge of a 
-  # pull-request (following the 'prepare_release' workflow). Since GitHub weirdly propagates the 
-  # original 'github.event_name' (here "pull_request") in all nested workflows, we need to 
+  # The CI can be triggered by the release workflow which itself can be triggered by the merge of a
+  # pull-request (following the 'prepare_release' workflow). Since GitHub weirdly propagates the
+  # original 'github.event_name' (here "pull_request") in all nested workflows, we need to
   # differentiate the release CI from regular CIs by using 'inputs.event_name', which should be set
   # to "release" by the release workflow
   IS_PR: ${{ github.event_name == 'pull_request' && inputs.event_name != 'release' }}
-  IS_WEEKLY: ${{ github.event_name == 'schedule' || ((github.event_name == 'workflow_dispatch') && (inputs.event_name == 'weekly')) }}
-  # The 'IS_RELEASE' variable indicates that the workflow has been triggered by the releasing 
+  # Run the weekly CI if it has been triggered manually by the weekly workflow, meaning
+  # 'inputs.event_name' is set to "weekly"
+  IS_WEEKLY: ${{ inputs.event_name == 'weekly'}}
+  # The 'IS_RELEASE' variable indicates that the workflow has been triggered by the releasing
   # process itself, before publishing it. It should only happen when the release workflow triggers
   # the CI, in which 'inputs.event_name' is set to "release"
   IS_RELEASE: ${{ inputs.event_name == 'release' }}
   IS_PUSH_TO_MAIN: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
   IS_PUSH_TO_RELEASE: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/heads/release/') }}
   IS_WORKFLOW_DISPATCH: ${{ github.event_name == 'workflow_dispatch' && inputs.manual_call}}
-  # The 'IS_PUBLISHED_RELEASE' variable indicates that the workflow has been triggered by a 
+  # The 'IS_PUBLISHED_RELEASE' variable indicates that the workflow has been triggered by a
   # release's successful publishing
   IS_PUBLISHED_RELEASE: ${{ github.event_name == 'release'}}
   AGENT_TOOLSDIRECTORY: /opt/hostedtoolcache
@@ -99,14 +93,70 @@ env:
   AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
   AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
   # The 'FAILED_TESTS_ARE_FLAKY' variable is used to print a warning messages if flaky tests are
-  # re-run. By default, we do not want to print this warning
+  # rerun. By default, we do not want to print this warning
   FAILED_TESTS_ARE_FLAKY: "false"
 
 jobs:
+  commit-checks:
+    name: Commit Checks
+    runs-on: ubuntu-24.04
+    outputs:
+      commits_ok: ${{ steps.commit-conformance.outcome == 'success' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Check commit signatures
+        id: check-commit-signatures
+        if: ${{ fromJSON(env.IS_PR) }}
+        uses: 1Password/check-signed-commits-action@ed2885f3ed2577a4f5d3c3fe895432a557d23d52
+
+      - name: Check commits first line format
+        id: commit-first-line
+        if: ${{ fromJSON(env.IS_PR) && !cancelled() }}
+        uses: gsactions/commit-message-checker@16fa2d5de096ae0d35626443bcd24f1e756cafee
+        with:
+          pattern: '^((build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)\:) .+$'
+          flags: 'gs'
+          error: "Your first line has to contain a commit type like \"feat: message\".\
+            Pattern: '^((build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)\\:)'"
+          excludeDescription: 'true' # optional: this excludes the description body of a pull request
+          excludeTitle: 'true' # optional: this excludes the title of a pull request
+          checkAllCommitMessages: 'true' # optional: this checks all commits associated with a pull request
+          accessToken: ${{ secrets.GITHUB_TOKEN }} # github access token is only required if checkAllCommitMessages is true
+
+      - name: Check commits line length
+        id: commit-line-length
+        if: ${{ fromJSON(env.IS_PR) && !cancelled() }}
+        uses: gsactions/commit-message-checker@16fa2d5de096ae0d35626443bcd24f1e756cafee
+        with:
+          pattern: '(^.{0,74}$\r?\n?){0,20}'
+          flags: 'gm'
+          error: 'The maximum line length of 74 characters is exceeded.'
+          excludeDescription: 'true'
+          excludeTitle: 'true'
+          checkAllCommitMessages: 'true'
+          accessToken: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Commit conformance
+        id: commit-conformance
+        if: ${{ !cancelled() }}
+        env:
+          SIGNATURE_OK: ${{ steps.check-commit-signatures.outcome == 'success' || steps.check-commit-signatures.outcome == 'skipped' }}
+          FIRST_LINE_OK: ${{ (fromJSON(env.IS_PR) && steps.commit-first-line.outcome == 'success') || steps.commit-first-line.outcome == 'skipped' }}
+          LINE_LENGTH_OK: ${{ (fromJSON(env.IS_PR) && steps.commit-line-length.outcome == 'success') || steps.commit-line-length.outcome == 'skipped' }}
+        run: |
+          if [[ "${SIGNATURE_OK}" != "true" || "${FIRST_LINE_OK}" != "true" || "${LINE_LENGTH_OK}" != "true" ]]; then
+            echo "Issues with commits. Signature ok: ${SIGNATURE_OK}. First line ok: ${FIRST_LINE_OK}. Line length ok: ${LINE_LENGTH_OK}."
+            exit 1
+          fi
+
   matrix-preparation:
+    name: Prepare versions and OS
+    needs: [commit-checks]
     # We skip the CI in cases of pushing to internal main (because all pushes to main internal are now from the bot)
-    if: ${{ !( github.repository == 'zama-ai/concrete-ml-internal' && github.event_name == 'push' && github.ref == 'refs/heads/main' ) }}
-    runs-on: ubuntu-20.04
+    if: ${{ !( github.repository != 'zama-ai/concrete-ml' && github.event_name == 'push' && github.ref == 'refs/heads/main' ) }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       linux-matrix: ${{ steps.set-matrix.outputs.linux-matrix }}
@@ -114,10 +164,14 @@ jobs:
       needs-38-linux-runner: ${{ steps.set-matrix.outputs.needs-38-linux-runner }}
       needs-39-linux-runner: ${{ steps.set-matrix.outputs.needs-39-linux-runner }}
       needs-310-linux-runner: ${{ steps.set-matrix.outputs.needs-310-linux-runner }}
+      needs-311-linux-runner: ${{ steps.set-matrix.outputs.needs-311-linux-runner }}
+      needs-312-linux-runner: ${{ steps.set-matrix.outputs.needs-312-linux-runner }}
       instance-type: ${{ steps.set-matrix.outputs.instance-type }}
+      linux-python-versions: ${{ steps.set-matrix.outputs.linux-python-versions }}
+      macos-python-versions: ${{ steps.set-matrix.outputs.macos-python-versions }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Set matrix
         id: set-matrix
@@ -147,9 +201,9 @@ jobs:
           # Manage instance type
           INSTANCE_TYPE="c5.4xlarge"
           if [[ "${BUILD_TYPE}" == "weekly" ]]; then
-            INSTANCE_TYPE="m6i.metal"
+            INSTANCE_TYPE="c6i.32xlarge"
           elif [[ "${BUILD_TYPE}" == "release" ]]; then
-            INSTANCE_TYPE="c6i.16xlarge"
+            INSTANCE_TYPE="c6i.32xlarge"
           fi
 
           # Manage python versions
@@ -157,13 +211,13 @@ jobs:
             LINUX_PYTHON_VERSIONS="${{ inputs.linux_python_versions }}"
             MACOS_PYTHON_VERSIONS="${{ inputs.macos_python_versions }}"
           elif [[ "${BUILD_TYPE}" == "pr" ]]; then
-            LINUX_PYTHON_VERSIONS="3.8"
+            LINUX_PYTHON_VERSIONS="3.8 3.12"
             MACOS_PYTHON_VERSIONS=""
           elif [[ "${BUILD_TYPE}" == "weekly" ]]; then
-            LINUX_PYTHON_VERSIONS="3.8 3.9 3.10"
+            LINUX_PYTHON_VERSIONS="3.8 3.9 3.10 3.11 3.12"
             MACOS_PYTHON_VERSIONS="3.9"
           elif [[ "${BUILD_TYPE}" == "release" ]] || [[ "${BUILD_TYPE}" == "published_release" ]]; then
-            LINUX_PYTHON_VERSIONS="3.8 3.9 3.10"
+            LINUX_PYTHON_VERSIONS="3.8 3.9 3.10 3.11 3.12"
             MACOS_PYTHON_VERSIONS=""
           elif [[ "${BUILD_TYPE}" == "push_to_main" ]]; then
             LINUX_PYTHON_VERSIONS="3.8"
@@ -175,9 +229,14 @@ jobs:
             echo "Unknown BUILD_TYPE! Aborting"
             exit 1
           fi
-          
+
           echo "LINUX_PYTHON_VERSIONS: ${LINUX_PYTHON_VERSIONS}"
           echo "MACOS_PYTHON_VERSIONS: ${MACOS_PYTHON_VERSIONS}"
+
+          # Used for the slack report
+          echo "linux-python-versions=${LINUX_PYTHON_VERSIONS}" >> $GITHUB_OUTPUT
+          echo "macos-python-versions=${MACOS_PYTHON_VERSIONS}" >> $GITHUB_OUTPUT
+
           echo "BUILD_TYPE: ${BUILD_TYPE}"
           echo "INSTANCE_TYPE: ${INSTANCE_TYPE}"
 
@@ -206,6 +265,10 @@ jobs:
             jq -rc '. | map(select(.os_kind=="linux" and .python_version=="3.9")) | length > 0')
           NEEDS_LINUX_310_RUNNER=$(echo "${LINUX_MATRIX}" | \
             jq -rc '. | map(select(.os_kind=="linux" and .python_version=="3.10")) | length > 0')
+          NEEDS_LINUX_311_RUNNER=$(echo "${LINUX_MATRIX}" | \
+            jq -rc '. | map(select(.os_kind=="linux" and .python_version=="3.11")) | length > 0')
+          NEEDS_LINUX_312_RUNNER=$(echo "${LINUX_MATRIX}" | \
+            jq -rc '. | map(select(.os_kind=="linux" and .python_version=="3.12")) | length > 0')
 
           echo "Needs Linux 3.8 runner:"
           echo "${NEEDS_LINUX_38_RUNNER}"
@@ -216,15 +279,23 @@ jobs:
           echo "Needs Linux 3.10 runner:"
           echo "${NEEDS_LINUX_310_RUNNER}"
 
+          echo "Needs Linux 3.11 runner:"
+          echo "${NEEDS_LINUX_311_RUNNER}"
+
+          echo "Needs Linux 3.12 runner:"
+          echo "${NEEDS_LINUX_312_RUNNER}"
+
           echo "needs-38-linux-runner=${NEEDS_LINUX_38_RUNNER}" >> $GITHUB_OUTPUT
           echo "needs-39-linux-runner=${NEEDS_LINUX_39_RUNNER}" >> $GITHUB_OUTPUT
           echo "needs-310-linux-runner=${NEEDS_LINUX_310_RUNNER}" >> $GITHUB_OUTPUT
+          echo "needs-311-linux-runner=${NEEDS_LINUX_311_RUNNER}" >> $GITHUB_OUTPUT
+          echo "needs-312-linux-runner=${NEEDS_LINUX_312_RUNNER}" >> $GITHUB_OUTPUT
           echo "instance-type=${INSTANCE_TYPE}" >> $GITHUB_OUTPUT
 
   start-runner-linux:
-    needs: [matrix-preparation]
-    name: Start EC2 runner
-    runs-on: ubuntu-20.04
+    needs: [commit-checks, matrix-preparation]
+    name: Start EC2 runner (Linux)
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     outputs:
       label-38: ${{ steps.start-ec2-runner-38.outputs.label }}
@@ -233,22 +304,26 @@ jobs:
       ec2-instance-id-39: ${{ steps.start-ec2-runner-39.outputs.ec2-instance-id || '' }}
       label-310: ${{ steps.start-ec2-runner-310.outputs.label }}
       ec2-instance-id-310: ${{ steps.start-ec2-runner-310.outputs.ec2-instance-id || '' }}
+      label-311: ${{ steps.start-ec2-runner-311.outputs.label }}
+      ec2-instance-id-311: ${{ steps.start-ec2-runner-311.outputs.ec2-instance-id || '' }}
+      label-312: ${{ steps.start-ec2-runner-312.outputs.label }}
+      ec2-instance-id-312: ${{ steps.start-ec2-runner-312.outputs.ec2-instance-id || '' }}
       matrix: ${{ steps.update-linux-matrix.outputs.linux-matrix }}
     steps:
       - name: Checkout Code
-        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@010d0da01d0b5a38af31e9c3470dbfdabdecca3a
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Start EC2 runner python 38
+      - name: Start EC2 runner python 3.8
         id: start-ec2-runner-38
         if: ${{ !cancelled() && fromJSON(needs.matrix-preparation.outputs.needs-38-linux-runner) }}
-        uses: machulav/ec2-github-runner@4e0303de215db88e1c489e07a15ca4d867f488ea
+        uses: machulav/ec2-github-runner@1827d6ca7544d7044ddbd2e9360564651b463da2
         with:
           mode: start
           github-token: ${{ secrets.EC2_RUNNER_BOT_TOKEN }}
@@ -269,10 +344,10 @@ jobs:
               {"Key": "Team", "Value": "CML"}
             ]
 
-      - name: Start EC2 runner python 39
+      - name: Start EC2 runner python 3.9
         id: start-ec2-runner-39
         if: ${{ !cancelled() && fromJSON(needs.matrix-preparation.outputs.needs-39-linux-runner) }}
-        uses: machulav/ec2-github-runner@4e0303de215db88e1c489e07a15ca4d867f488ea
+        uses: machulav/ec2-github-runner@1827d6ca7544d7044ddbd2e9360564651b463da2
         with:
           mode: start
           github-token: ${{ secrets.EC2_RUNNER_BOT_TOKEN }}
@@ -293,10 +368,10 @@ jobs:
               {"Key": "Team", "Value": "CML"}
             ]
 
-      - name: Start EC2 runner python 310
+      - name: Start EC2 runner python 3.10
         id: start-ec2-runner-310
         if: ${{ !cancelled() && fromJSON(needs.matrix-preparation.outputs.needs-310-linux-runner) }}
-        uses: machulav/ec2-github-runner@4e0303de215db88e1c489e07a15ca4d867f488ea
+        uses: machulav/ec2-github-runner@1827d6ca7544d7044ddbd2e9360564651b463da2
         with:
           mode: start
           github-token: ${{ secrets.EC2_RUNNER_BOT_TOKEN }}
@@ -317,6 +392,53 @@ jobs:
               {"Key": "Team", "Value": "CML"}
             ]
 
+      - name: Start EC2 runner python 3.11
+        id: start-ec2-runner-311
+        if: ${{ !cancelled() && fromJSON(needs.matrix-preparation.outputs.needs-311-linux-runner) }}
+        uses: machulav/ec2-github-runner@1827d6ca7544d7044ddbd2e9360564651b463da2
+        with:
+          mode: start
+          github-token: ${{ secrets.EC2_RUNNER_BOT_TOKEN }}
+          ec2-image-id: ${{ secrets.AWS_EC2_AMI }}
+          ec2-instance-type: ${{ needs.matrix-preparation.outputs.instance-type }}
+          subnet-id: ${{ secrets.AWS_EC2_SUBNET_ID }}
+          security-group-id: ${{ secrets.AWS_EC2_SECURITY_GROUP_ID }}
+          aws-resource-tags: >
+            [
+              {"Key": "Name", "Value": "cml-ci-ec2-github-runner-py311"},
+              {"Key": "GitHubRepository", "Value": "${{ github.repository }}"},
+              {"Key": "Python version", "Value": "3.11"},
+              {"Key": "Actor", "Value": "${{ github.actor }}"},
+              {"Key": "Action", "Value": "${{ github.action }}"},
+              {"Key": "GitHash", "Value": "${{ github.sha }}"},
+              {"Key": "RefName", "Value": "${{ github.ref_name }}"},
+              {"Key": "RunId", "Value": "${{ github.run_id }}"},
+              {"Key": "Team", "Value": "CML"}
+            ]
+
+      - name: Start EC2 runner python 3.12
+        id: start-ec2-runner-312
+        if: ${{ !cancelled() && fromJSON(needs.matrix-preparation.outputs.needs-312-linux-runner) }}
+        uses: machulav/ec2-github-runner@1827d6ca7544d7044ddbd2e9360564651b463da2
+        with:
+          mode: start
+          github-token: ${{ secrets.EC2_RUNNER_BOT_TOKEN }}
+          ec2-image-id: ${{ secrets.AWS_EC2_AMI }}
+          ec2-instance-type: ${{ needs.matrix-preparation.outputs.instance-type }}
+          subnet-id: ${{ secrets.AWS_EC2_SUBNET_ID }}
+          security-group-id: ${{ secrets.AWS_EC2_SECURITY_GROUP_ID }}
+          aws-resource-tags: >
+            [
+              {"Key": "Name", "Value": "cml-ci-ec2-github-runner-py312"},
+              {"Key": "GitHubRepository", "Value": "${{ github.repository }}"},
+              {"Key": "Python version", "Value": "3.12"},
+              {"Key": "Actor", "Value": "${{ github.actor }}"},
+              {"Key": "Action", "Value": "${{ github.action }}"},
+              {"Key": "GitHash", "Value": "${{ github.sha }}"},
+              {"Key": "RefName", "Value": "${{ github.ref_name }}"},
+              {"Key": "RunId", "Value": "${{ github.run_id }}"},
+              {"Key": "Team", "Value": "CML"}
+            ]
 
       - name: Update Linux runs_on Matrix
         id: update-linux-matrix
@@ -329,6 +451,10 @@ jobs:
           '(. | map(select(.os_kind=="linux" and .python_version=="3.9") |= . + {"runs_on": "${{ steps.start-ec2-runner-39.outputs.label }}"}) )')
           MATRIX=$(echo "${MATRIX}" | jq -rc \
           '(. | map(select(.os_kind=="linux" and .python_version=="3.10") |= . + {"runs_on": "${{ steps.start-ec2-runner-310.outputs.label }}"}) )')
+          MATRIX=$(echo "${MATRIX}" | jq -rc \
+          '(. | map(select(.os_kind=="linux" and .python_version=="3.11") |= . + {"runs_on": "${{ steps.start-ec2-runner-311.outputs.label }}"}) )')
+          MATRIX=$(echo "${MATRIX}" | jq -rc \
+          '(. | map(select(.os_kind=="linux" and .python_version=="3.12") |= . + {"runs_on": "${{ steps.start-ec2-runner-312.outputs.label }}"}) )')
 
           echo "Updated matrix:"
           echo "${MATRIX}"
@@ -336,6 +462,7 @@ jobs:
           echo "linux-matrix=${MATRIX}" >> $GITHUB_OUTPUT
 
   build-linux:
+    name: Python ${{ matrix.python_version }} (Linux)
     needs: [start-runner-linux]
     runs-on: ${{ matrix.runs_on }}
     # Run in a clean container
@@ -350,9 +477,10 @@ jobs:
     env:
       IS_REF_BUILD: ${{ matrix.python_version == '3.8' }}
       PIP_INDEX_URL: ${{ secrets.PIP_INDEX_URL }}
-      PIP_EXTRA_INDEX_URL: ${{ secrets.PIP_EXTRA_INDEX_URL }}
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+    outputs:
+      hashes: ${{ steps.hash.outputs.hashes }}
 
     steps:
       - name: Add masks
@@ -380,18 +508,17 @@ jobs:
       # Checkout the code
       # 'fetch-depth' is set to 0 in order to fetch all tags (used for generating the changelog)
       - name: Checkout Code
-        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
-      
-      # Pull the only LFS files needed for regular tests, avoiding to download files stored for 
-      # benchmarks and use cases 
-      - name: Pull LFS test files
+
+      # Pull necessary LFS files (and thus avoid downloading files stored for benchmarks, use cases, ...)
+      - name: Pull LFS files
         run: |
-          git lfs pull --include "tests/data" --exclude  ""
+          git lfs pull --include "tests/data/**, src/concrete/ml/pandas/_client_server_files/**" --exclude  ""
 
       - name: Set up Python ${{ matrix.python_version }}
-        uses: actions/setup-python@65d7f2d534ac1bc67fcd62888c5f4f3d2cb2b236
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b
         id: setup-python
         with:
           python-version: ${{ matrix.python_version }}
@@ -420,45 +547,6 @@ jobs:
 
           make setup_env
 
-      - name: Check commits first line format
-        id: commit-first-line
-        if: ${{ fromJSON(env.IS_PR) && steps.install-deps.outcome == 'success' && !cancelled() }}
-        uses: gsactions/commit-message-checker@16fa2d5de096ae0d35626443bcd24f1e756cafee
-        with:
-          pattern: '^((feat|fix|chore|refactor|style|test|docs)(\((bounds|helpers|data_types|debugging|extensions|fhe_circuit|mlir|graph|optimization|representation|tracing|values|benchmarks|ci|scripts|compilation|execution|deps)\))?(\!)?\:) .+$'
-          flags: 'gs'
-          error: "Your first line has to contain a commit type and scope like \"feat(my_feature): msg\".\
-            Pattern: '^((feat|fix|chore|refactor|style|test|docs)(\\((bounds|helpers|data_types|debugging|extensions|fhe_circuit|mlir|graph|optimization|representation|tracing|values|benchmarks|ci|scripts|compilation|execution|deps)\\))(\\!)??\\:)'"
-          excludeDescription: 'true' # optional: this excludes the description body of a pull request
-          excludeTitle: 'true' # optional: this excludes the title of a pull request
-          checkAllCommitMessages: 'true' # optional: this checks all commits associated with a pull request
-          accessToken: ${{ secrets.GITHUB_TOKEN }} # github access token is only required if checkAllCommitMessages is true
-
-      - name: Check commits line length
-        id: commit-line-length
-        if: ${{ fromJSON(env.IS_PR) && steps.install-deps.outcome == 'success' && !cancelled() }}
-        uses: gsactions/commit-message-checker@16fa2d5de096ae0d35626443bcd24f1e756cafee
-        with:
-          pattern: '(^.{0,74}$\r?\n?){0,20}'
-          flags: 'gm'
-          error: 'The maximum line length of 74 characters is exceeded.'
-          excludeDescription: 'true' # optional: this excludes the description body of a pull request
-          excludeTitle: 'true' # optional: this excludes the title of a pull request
-          checkAllCommitMessages: 'true' # optional: this checks all commits associated with a pull request
-          accessToken: ${{ secrets.GITHUB_TOKEN }} # github access token is only required if checkAllCommitMessages is true
-
-      - name: Commit conformance
-        id: commit-conformance
-        if: ${{ steps.install-deps.outcome == 'success' && !cancelled() }}
-        env:
-          FIRST_LINE_OK: ${{ (fromJSON(env.IS_PR) && steps.commit-first-line.outcome == 'success') || steps.commit-first-line.outcome == 'skipped' }}
-          LINE_LENGTH_OK: ${{ (fromJSON(env.IS_PR) && steps.commit-line-length.outcome == 'success') || steps.commit-line-length.outcome == 'skipped' }}
-        run: |
-          if [[ "${FIRST_LINE_OK}" != "true" || "${LINE_LENGTH_OK}" != "true" ]]; then
-            echo "Issues with commits. First line ok: ${FIRST_LINE_OK}. Line length ok: ${LINE_LENGTH_OK}."
-            exit 1
-          fi
-
       - name: Check actionlint
         run:
           make actionlint
@@ -470,17 +558,17 @@ jobs:
         run: |
           make pcc
 
-      # Checked for changes between main and the current branch in a PR. More specifically, 
-      # this is used in regular CIs to avoid launching Pytest, checking codeblocks, building docs 
+      # Checked for changes between main and the current branch in a PR. More specifically,
+      # this is used in regular CIs to avoid launching Pytest, checking codeblocks, building docs
       # or other steps if the associated files were not touched. For most, we also check that the
       # linux MD5 has not changed, which means that no libraries got updated. This is done in order
       # to handle PRs which only upgrades dependencies
-      # Following the 'files_yaml' section, we define what files should trigger a defined acronym 
-      # (src, codeblocks, ...) when some changes are detected in them. For example, if some 
+      # Following the 'files_yaml' section, we define what files should trigger a defined acronym
+      # (src, codeblocks, ...) when some changes are detected in them. For example, if some
       # dependencies were changed, 'tests', 'determinism', 'codeblocks' and 'determinism' acronyms
-      # will be affected. We use the license MD5 file for that because it is built on the 
+      # will be affected. We use the license MD5 file for that because it is built on the
       # poetry.lock as well as the Concrete Python version, which can be installed manually in the
-      # makefile. 
+      # makefile.
       # For codeblocks, 'make pytest_codeblocks' runs the `make_utils/pytest_codeblocks.sh` script,
       # which executes a find and grep command to find them. In the following section, we manually
       # re-define what this command does by looking at all markdown files that are neither in hidden
@@ -490,12 +578,12 @@ jobs:
       # as for release and weekly checks, as there are no changes to check in these cases
       - name: Get all changed files from main in PR
         id: changed-files-in-pr
-        if: | 
+        if: |
           fromJSON(env.IS_PR)
           && steps.install-deps.outcome == 'success'
-          && steps.make-pcc.outcome == 'success' 
+          && steps.make-pcc.outcome == 'success'
           && !cancelled()
-        uses: tj-actions/changed-files@v39.2.2
+        uses: tj-actions/changed-files@bab30c2299617f6615ec02a68b9a40d10bd21366 # v45.0.5
         with:
           files_yaml: |
             src:
@@ -510,6 +598,8 @@ jobs:
               - tests/seeding/test_seeding.py
             docs:
               - docs/**
+              - '*.md'
+              - LICENSE
             use_cases:
               - use_case_examples/**
             codeblocks:
@@ -517,6 +607,7 @@ jobs:
               - '!.*/**'
               - '!docs/_*/**'
               - '!docs/SUMMARY.md'
+              - '!docs/references/api/**.md'
             dependencies:
               - deps_licenses/licenses_linux_user.txt.md5
             conftest:
@@ -525,7 +616,7 @@ jobs:
               - Makefile
 
       # Run determinism test if:
-      # - during weekly or release CI, as well as when the CI has been triggered manually (through 
+      # - during weekly or release CI, as well as when the CI has been triggered manually (through
       # GitHub's Action interface)
       # - the determinism test file has been changed
       # - the source code has been changed
@@ -536,55 +627,56 @@ jobs:
         id: determinism
         if: |
           (
-            steps.changed-files-in-pr.outcome == 'skipped' 
+            steps.changed-files-in-pr.outcome == 'skipped'
             || steps.changed-files-in-pr.outputs.determinism_any_changed == 'true'
             || steps.changed-files-in-pr.outputs.src_any_changed == 'true'
             || steps.changed-files-in-pr.outputs.dependencies_any_changed == 'true'
             || steps.changed-files-in-pr.outputs.conftest_any_changed == 'true'
             || steps.changed-files-in-pr.outputs.makefile_any_changed == 'true'
           )
-          && steps.install-deps.outcome == 'success' 
-          && steps.make-pcc.outcome == 'success' 
+          && steps.install-deps.outcome == 'success'
+          && steps.make-pcc.outcome == 'success'
           && !cancelled()
         run: |
           make determinism
 
-      # Build the documentation if :
+      # Fix the documentation for Gitbook if :
       # - the current workflow takes place in a release CI with the reference build
-      # - the current workflow takes place in a weekly CI or it has been triggered manually (through 
+      # - the current workflow takes place in a weekly CI or it has been triggered manually (through
       # GitHub's Action interface)
       # - any documentation files has been changed
       # - the source code has been changed
       # - Makefile has been changed
-      - name: Build docs
-        id: build-docs
+      - name: Fix docs
+        id: fix-docs
         if: |
           (
             (fromJSON(env.IS_RELEASE) && fromJSON(env.IS_REF_BUILD))
-            || steps.changed-files-in-pr.outcome == 'skipped' 
-            || steps.changed-files-in-pr.outputs.docs_any_changed == 'true' 
-            || steps.changed-files-in-pr.outputs.use_cases_any_changed == 'true' 
+            || steps.changed-files-in-pr.outcome == 'skipped'
+            || steps.changed-files-in-pr.outputs.docs_any_changed == 'true'
+            || steps.changed-files-in-pr.outputs.use_cases_any_changed == 'true'
             || steps.changed-files-in-pr.outputs.src_any_changed == 'true'
             || steps.changed-files-in-pr.outputs.makefile_any_changed == 'true'
           )
-          && steps.install-deps.outcome == 'success' 
-          && steps.make-pcc.outcome == 'success' 
-          && steps.determinism.outcome != 'failure' 
+          && steps.install-deps.outcome == 'success'
+          && steps.make-pcc.outcome == 'success'
+          && steps.determinism.outcome != 'failure'
           && !cancelled()
         run: |
           make docs_no_links
-      
+
       # Do not check links during the release process in order to avoid temporary connection errors
       - name: Check links
         id: check_links
         if: |
           !fromJSON(env.IS_RELEASE)
-          && steps.build-docs.outcome == 'success'
+          && steps.fix-docs.outcome == 'success'
           && !cancelled()
         run: |
           make check_links
+          make check_symlinks
 
-      # Make sure all necessary steps passed. For build-docs and determinism steps, we only check for 
+      # Make sure all necessary steps passed. For fix-docs and determinism steps, we only check for
       # non-failures as the 'changed-files-in-pr' step might skip them
       - name: Stop if previous steps failed
         id: conformance
@@ -592,51 +684,28 @@ jobs:
         env:
           CONFORMANCE_STATUS: >-
             ${{
-              steps.commit-conformance.outcome == 'success' 
-              && steps.make-pcc.outcome == 'success' 
+              steps.make-pcc.outcome == 'success'
               && steps.determinism.outcome != 'failure'
-              && steps.build-docs.outcome != 'failure'
+              && steps.fix-docs.outcome != 'failure'
               && steps.check_links.outcome != 'failure'
             }}
         run: |
           if [[ "${CONFORMANCE_STATUS}" != "true" ]]; then
             echo "Conformance failed, got:"
-            echo "Commit conformance success step: ${{ steps.commit-conformance.outcome }}"
             echo "Make conformance step: ${{ steps.make-pcc.outcome }}"
             echo "Determinism step: ${{ steps.determinism.outcome }}"
-            echo "Build docs step: ${{ steps.build-docs.outcome }}"
+            echo "Fix docs step: ${{ steps.fix-docs.outcome }}"
             echo "Check links step: ${{ steps.check_links.outcome }}"
             exit 1
           fi
 
-      # Tar the docs for releases with the reference build only
-      # Taring the docs allows for much faster upload speed (from ~3min worst case to ~2s best case)
-      - name: Tar docs artifacts
-        id: tar-docs
-        if:  |
-          fromJSON(env.IS_RELEASE) 
-          && fromJSON(env.IS_REF_BUILD) 
-          && steps.conformance.outcome == 'success' 
-          && steps.build-docs.outcome == 'success' 
-          && !cancelled()
-        run: |
-          cd docs/_build/html
-          tar -cvf docs.tar ./*
-
-      - name: Upload docs artifacts
-        if: ${{ steps.tar-docs.outcome == 'success' && !cancelled() }}
-        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce
-        with:
-          name: html-docs
-          path: docs/_build/html/docs.tar
-
       # Generate the changelog for releases with the reference build only
-      # The changelog is generated by considering all commits from the latest stable previous 
+      # The changelog is generated by considering all commits from the latest stable previous
       # version (not a release candidate) up to the new upcoming version
       - name: Generate release changelog
         id: changelog
         if: |
-          fromJSON(env.IS_RELEASE) 
+          fromJSON(env.IS_RELEASE)
           && fromJSON(env.IS_REF_BUILD)
           && steps.conformance.outcome == 'success'
           && !cancelled()
@@ -647,10 +716,10 @@ jobs:
           echo "changelog-file=${CHANGELOG_FILE}" >> $GITHUB_OUTPUT
           poetry run python ./script/make_utils/changelog_helper.py \
           --to-ref "${{ github.sha }}" > "${CHANGELOG_FILE}"
-  
+
       - name: Upload changelog artifacts
         if: ${{ steps.changelog.outcome == 'success' && !cancelled() }}
-        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
         with:
           name: changelog
           path: ${{ steps.changelog.outputs.changelog-file }}
@@ -661,44 +730,51 @@ jobs:
       # and macOS as long as the dependencies are available
       - name: Build wheel
         id: build-wheel
-        if: | 
+        if: |
           fromJSON(env.IS_RELEASE)
-          && fromJSON(env.IS_REF_BUILD) 
-          && steps.conformance.outcome == 'success' 
+          && fromJSON(env.IS_REF_BUILD)
+          && steps.conformance.outcome == 'success'
           && !cancelled()
         run: |
           rm -rf dist
           poetry build -f wheel
 
+      - name: "Generate hashes"
+        id: hash
+        if: ${{ steps.build-wheel.outcome == 'success' && !cancelled() }}
+        run: |
+          cd dist && echo "hashes=$(sha256sum * | base64 -w0)" >> $GITHUB_OUTPUT
+
       - name: Upload wheel artifacts
         if: ${{ steps.build-wheel.outcome == 'success' && !cancelled() }}
-        uses: actions/upload-artifact@0b7f8abb1508181956e8e162db84b466c27e18ce
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882
         with:
           name: py3-wheel
           path: dist/*.whl
-      
-      # Run Pytest on a subset of our tests if :
-      # - the current workflow does no take place in a weekly or release CI
+
+      # Run pytest if :
+      # - the current workflow does no take place release CI
       # - if the CI has been triggered manually (through GitHub's Action interface)
       # - the source code has been changed
       # - any tests utils (pytest, data) has been changed
-      # - any dependency has been updated 
+      # - any dependency has been updated
       # - conftest.py has been changed
       # - Makefile has been changed
+      # If the workflow takes place in a release CI, an option is added to take into account more tests
       # If only some test files were changed, this step is skipped and each associated tests will be
       # run individually in a following step (pytest_modified_tests_only)
-      # If regular tests failed, a following script checks for flaky tests. If all failed tests 
-      # are known flaky tests, they are re-run. Otherwise, the step exits with status 1.
-      # The 'bash +e {0}' is added here in order to make sure that the step does not exit directly 
+      # If regular tests failed, a following script checks for flaky tests. If all failed tests
+      # are known flaky tests, they are rerun. Otherwise, the step exits with status 1.
+      # The 'bash +e {0}' is added here in order to make sure that the step does not exit directly
       # if 'make pytest' fails
-      - name: PyTest Source Code (regular)
-        id: pytest_regular
+      - name: PyTest Source Code (regular, weekly)
+        id: pytest
         if: |
           (
             (
-              steps.changed-files-in-pr.outcome == 'success' 
+              steps.changed-files-in-pr.outcome == 'success'
               && (
-                steps.changed-files-in-pr.outputs.src_any_changed == 'true' 
+                steps.changed-files-in-pr.outputs.src_any_changed == 'true'
                 || steps.changed-files-in-pr.outputs.tests_utils_any_changed == 'true'
                 || steps.changed-files-in-pr.outputs.dependencies_any_changed == 'true'
                 || steps.changed-files-in-pr.outputs.conftest_any_changed == 'true'
@@ -706,97 +782,110 @@ jobs:
               )
             )
             || fromJSON(env.IS_WORKFLOW_DISPATCH)
+            || fromJSON(env.IS_WEEKLY)
           )
-          && steps.conformance.outcome == 'success' 
+          && steps.conformance.outcome == 'success'
           && !cancelled()
-        shell: bash +e {0}
         run: |
-          make pytest_and_report
+          if [[ "${{ env.IS_WEEKLY }}" == "true" ]]; then
+            PYTEST_OPTIONS="--weekly"
+          else
+            PYTEST_OPTIONS=""
+          fi
+
+          set +e  # Disable exit on error to capture the exit code
+          make pytest_and_report PYTEST_OPTIONS=${PYTEST_OPTIONS}
+          pytest_exit_code=$?
+          set -e  # Re-enable exit on error
 
           # If regular tests failed, check for flaky tests
-          if [ $? -ne 0 ]; then
-
+          if [ $pytest_exit_code -ne 0 ]; then
             # Convert pytest report to formatted report with only information about failed tests
-          	poetry run python ./script/actions_utils/pytest_failed_test_report.py \
-            --pytest-input-report "pytest_report.json" \
-            --failed-tests-report "failed_tests_report.json" \
-            --failed-tests-comment "failed_tests_comment.txt"
+            poetry run python ./script/actions_utils/pytest_failed_test_report.py \
+              --pytest-input-report "pytest_report.json" \
+              --failed-tests-report "failed_tests_report.json" \
+              --failed-tests-comment "failed_tests_comment_${{ matrix.python_version }}.txt" \
+              --failed-tests-list "failed_tests_slack_list_${{ matrix.python_version }}.txt"
 
             # Check if all failed tests are known flaky tests
             FAILED_TESTS_ARE_FLAKY=$(jq .all_failed_tests_are_flaky "failed_tests_report.json")
 
             echo "FAILED_TESTS_ARE_FLAKY=${FAILED_TESTS_ARE_FLAKY}" >> "$GITHUB_ENV"
 
-            # If all failed tests are known flaky tests, try to re-run them
+            # If all failed tests are known flaky tests, try to rerun them
             if [[ "${FAILED_TESTS_ARE_FLAKY}" == "true" ]]; then
               make pytest_run_last_failed
-            
+
             # Else, return exit status 1 in order to make this step fail
             else
               exit 1
             fi
           fi
 
-      # If regular tests passed but at least one known flaky test have been re-run, a warning
+      # Upload the list of flaky tests that have been re-run (if the only failed tests were flaky)
+      - name: Upload flaky tests list (weekly)
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        if: |
+          fromJSON(env.IS_WEEKLY)
+          && steps.pytest.outcome == 'success'
+          && fromJSON(env.FAILED_TESTS_ARE_FLAKY)
+          && !cancelled()
+        with:
+          name: failed_flaky_${{ matrix.python_version }}
+          path: failed_tests_slack_list_${{ matrix.python_version }}.txt
+
+      # If regular tests passed but at least one known flaky test have been rerun, a warning
       # comment is published in the PR and all flaky tests that initially failed are listed
-      - name: Warn PR with flaky tests
-        uses: marocchino/sticky-pull-request-comment@efaaab3fd41a9c3de579aba759d2552635e590fd
-        if: steps.pytest_regular.outcome == 'success' && fromJSON(env.FAILED_TESTS_ARE_FLAKY) && !cancelled()
+      - name: Warn PR with flaky tests (regular)
+        uses: marocchino/sticky-pull-request-comment@331f8f5b4215f0445d3c07b4967662a32a2d3e31
+        if: |
+          fromJSON(env.IS_PR)
+          && steps.pytest.outcome == 'success'
+          && fromJSON(env.FAILED_TESTS_ARE_FLAKY)
+          && !cancelled()
         with:
           header: flaky-test
           recreate: true
-          path: failed_tests_comment.txt
+          path: failed_tests_comment_${{ matrix.python_version }}.txt
 
-      # If regular pytest step has been skipped but some changes has been detected in test files, 
-      # meaning there was no other changed impacting our testing suite, we only need to run these 
+      # If pytest step has been skipped but some changes has been detected in test files,
+      # meaning there was no other changed impacting our testing suite, we only need to run these
       # modified tests
-      # Note that if pytest utils or test data are changed, the regular pytest step should have been
+      # Note that if pytest utils or test data are changed, the pytest step should have been
       # triggered instead
       - name: PyTest on modified tests only
         id: pytest_modified_tests_only
         if: |
-          steps.changed-files-in-pr.outcome == 'success'
-          && steps.pytest_regular.outcome == 'skipped'
+          fromJSON(env.IS_PR)
+          && steps.changed-files-in-pr.outcome == 'success'
+          && steps.pytest.outcome == 'skipped'
           && steps.changed-files-in-pr.outputs.tests_any_changed == 'true'
-          && steps.conformance.outcome == 'success' 
+          && steps.conformance.outcome == 'success'
           && !cancelled()
         run: |
+          # Exit immediately if any command fails
+          set -e
+          
           for file in ${{ steps.changed-files-in-pr.outputs.tests_all_changed_files }}; do
               make pytest_one TEST="$file"
           done
 
-      # Run Pytest on all of our tests on a weekly basis
-      - name: PyTest Source Code (weekly)
-        id: pytest_weekly
-        if: ${{ fromJSON(env.IS_WEEKLY) && steps.conformance.outcome == 'success' && !cancelled() }}
-        run: |
-          make pytest PYTEST_OPTIONS=--weekly
-
-      # Run Pytest on all of our tests on a weekly basis using PyPI's local wheel
-      - name: PyTest with PyPI local wheel of Concrete ML (weekly)
+      # Run Pytest on all of our tests (except flaky ones) using PyPI's local wheel in the weekly
+      # or during the release process
+      - name: PyTest (no flaky) with PyPI local wheel of Concrete ML (weekly, release)
         if: |
-          fromJSON(env.IS_WEEKLY)
-          && steps.conformance.outcome == 'success' 
-          && !cancelled()
-        run: |
-          make pytest_pypi_wheel_cml
-
-      # Run Pytest on all of our tests (except flaky ones) using PyPI's local wheel during the 
-      # release process
-      - name: PyTest (no flaky) with PyPI local wheel of Concrete ML (release)
-        if: |
-          fromJSON(env.IS_RELEASE)
-          && steps.conformance.outcome == 'success' 
+          (fromJSON(env.IS_WEEKLY) || fromJSON(env.IS_RELEASE))
+          && steps.conformance.outcome == 'success'
           && !cancelled()
         run: |
           make pytest_pypi_wheel_cml_no_flaky
 
-      # Run Pytest on all of our tests (except flaky ones) using Concrete ML's latest version 
+      # Run Pytest on all of our tests (except flaky ones) using Concrete ML's latest version
       # available on PyPI after publishing a release
       - name: PyTest (no flaky) with PyPI (published release)
         if: |
           fromJSON(env.IS_PUBLISHED_RELEASE)
-          && steps.conformance.outcome == 'success' 
+          && steps.conformance.outcome == 'success'
           && !cancelled()
         run: |
           PROJECT_VERSION="$(poetry version --short)"
@@ -807,17 +896,14 @@ jobs:
       - name: Test coverage (regular, weekly)
         id: coverage
         if: |
-          fromJSON(env.IS_REF_BUILD) 
-          && (
-            steps.pytest_regular.outcome != 'skipped' 
-            || steps.pytest_weekly.outcome != 'skipped'
-          ) 
+          fromJSON(env.IS_REF_BUILD)
+          && steps.pytest.outcome != 'skipped'
           && !cancelled()
         run: |
           ./script/actions_utils/coverage.sh global-coverage-infos.json
 
       - name: Comment with coverage
-        uses: marocchino/sticky-pull-request-comment@efaaab3fd41a9c3de579aba759d2552635e590fd
+        uses: marocchino/sticky-pull-request-comment@331f8f5b4215f0445d3c07b4967662a32a2d3e31
         if: ${{ steps.coverage.outcome != 'skipped' && !cancelled() }}
         continue-on-error: true
         with:
@@ -835,9 +921,9 @@ jobs:
         if: |
           (
             (
-              steps.changed-files-in-pr.outcome == 'success' 
+              steps.changed-files-in-pr.outcome == 'success'
               && (
-                steps.changed-files-in-pr.outputs.src_any_changed == 'true' 
+                steps.changed-files-in-pr.outputs.src_any_changed == 'true'
                 || steps.changed-files-in-pr.outputs.codeblocks_any_changed == 'true'
                 || steps.changed-files-in-pr.outputs.dependencies_any_changed == 'true'
                 || steps.changed-files-in-pr.outputs.makefile_any_changed == 'true'
@@ -845,7 +931,7 @@ jobs:
             )
             || fromJSON(env.IS_WORKFLOW_DISPATCH)
           )
-          && steps.conformance.outcome == 'success' 
+          && steps.conformance.outcome == 'success'
           && !cancelled()
         run: |
           make pytest_codeblocks
@@ -853,18 +939,18 @@ jobs:
       # Run Pytest on all codeblocks on a weekly basis or while releasing
       - name: PyTest CodeBlocks with PyPI local wheel of Concrete ML (weekly, release)
         if: |
-          (fromJSON(env.IS_WEEKLY) || fromJSON(env.IS_RELEASE)) 
-          && steps.conformance.outcome == 'success' 
+          (fromJSON(env.IS_WEEKLY) || fromJSON(env.IS_RELEASE))
+          && steps.conformance.outcome == 'success'
           && !cancelled()
         run: |
-          make pytest_codeblocks_pypi_wheel_cml 
+          make pytest_codeblocks_pypi_wheel_cml
 
-      # Run Pytest on all codeblocks using Concrete ML's latest version available on PyPI after 
+      # Run Pytest on all codeblocks using Concrete ML's latest version available on PyPI after
       # publishing a release
       - name: PyTest CodeBlocks with PyPI (published release)
         if: |
-          fromJSON(env.IS_PUBLISHED_RELEASE) 
-          && steps.conformance.outcome == 'success' 
+          fromJSON(env.IS_PUBLISHED_RELEASE)
+          && steps.conformance.outcome == 'success'
           && !cancelled()
         run: |
           PROJECT_VERSION="$(poetry version --short)"
@@ -872,33 +958,38 @@ jobs:
           make pytest_codeblocks_pypi_cml VERSION="$PROJECT_VERSION"
 
       # Run Pytest on all notebooks on a weekly basis
+      # Note: some notebooks need specific data stored in LFS
       - name: PyTest Notebooks (weekly)
-        if: | 
-          fromJSON(env.IS_WEEKLY) 
-          && steps.conformance.outcome == 'success' 
+        if: |
+          fromJSON(env.IS_WEEKLY)
+          && steps.conformance.outcome == 'success'
           && !cancelled()
         run: |
+          git lfs pull --include "docs/advanced_examples/data/**" --exclude  ""
+
           make pytest_nb
 
       - name: Fast sanity check
         if: ${{ steps.conformance.outcome == 'success' && !cancelled() }}
         run: |
           make fast_sanity_check
-      
+
       # Check installation with sync_env
       - name: Check installation with sync_env and python ${{ matrix.python_version }} (weekly, release)
         if: |
-            (fromJSON(env.IS_WEEKLY) || fromJSON(env.IS_RELEASE)) 
-            && steps.conformance.outcome == 'success' 
+            (fromJSON(env.IS_WEEKLY) || fromJSON(env.IS_RELEASE))
+            && steps.conformance.outcome == 'success'
             && !cancelled()
         run: |
           ./script/make_utils/check_installation_with_all_python.sh --version ${{ matrix.python_version }} --sync_env
 
+      # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4679
       # Check installation with pip
-      - name: Check installation with pip and python ${{ matrix.python_version }} (weekly, release)
+      - name: Check installation with pip and python ${{ matrix.python_version }} (weekly)
         if: |
-            (fromJSON(env.IS_WEEKLY) || fromJSON(env.IS_RELEASE)) 
-            && steps.conformance.outcome == 'success' 
+            (fromJSON(env.IS_WEEKLY))
+            && matrix.python_version != '3.12'
+            && steps.conformance.outcome == 'success'
             && !cancelled()
         run: |
           ./script/make_utils/check_installation_with_all_python.sh --version ${{ matrix.python_version }} --pip
@@ -906,8 +997,8 @@ jobs:
       # Check installation with wheel
       - name: Check installation with wheel and python ${{ matrix.python_version }} (weekly, release)
         if: |
-            (fromJSON(env.IS_WEEKLY) || fromJSON(env.IS_RELEASE)) 
-            && steps.conformance.outcome == 'success' 
+            (fromJSON(env.IS_WEEKLY) || fromJSON(env.IS_RELEASE))
+            && steps.conformance.outcome == 'success'
             && !cancelled()
         run: |
           ./script/make_utils/check_installation_with_all_python.sh --version ${{ matrix.python_version }} --wheel
@@ -915,21 +1006,33 @@ jobs:
       # Check installation with git clone
       - name: Check installation with clone and python ${{ matrix.python_version }} (weekly, release)
         if: |
-            (fromJSON(env.IS_WEEKLY) || fromJSON(env.IS_RELEASE)) 
-            && steps.conformance.outcome == 'success' 
+            (fromJSON(env.IS_WEEKLY) || fromJSON(env.IS_RELEASE))
+            && steps.conformance.outcome == 'success'
             && !cancelled()
         run: |
           ./script/make_utils/check_installation_with_all_python.sh --version ${{ matrix.python_version }} --clone
 
+  provenance:
+      needs: [build-linux]
+      permissions:
+        actions: read
+        contents: write
+        id-token: write # Needed to access the workflow's OIDC identity.
+      uses: slsa-framework/slsa-github-generator/.github/workflows/generator_generic_slsa3.yml@v2.0.0 # Not pinned by commit on purpose
+      # see https://github.com/slsa-framework/slsa-github-generator/blob/main/README.md#referencing-slsa-builders-and-generators
+      if: ${{ needs.build-linux.outputs.hashes != '' }}
+      with:
+        base64-subjects: "${{ needs.build-linux.outputs.hashes }}"
+
   # This is to manage build matrices and have a single status point for PRs
-  # This can be updated to take macOS into account but it is impractical because of long builds 
+  # This can be updated to take macOS into account but it is impractical because of long builds
   # and therefore expensive macOS testing
   linux-build-status:
-    name: Linux build status
+    name: Build Status (Linux)
     needs: [build-linux]
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
-    if: ${{ always() }}
+    if: success() || failure()
     steps:
       - name: Fail on unsuccessful Linux build
         shell: bash
@@ -944,34 +1047,22 @@ jobs:
             exit 1
           fi
 
-      - name: Slack Notification
-        if: ${{ always() && !success() }}
-        continue-on-error: true
-        uses: rtCamp/action-slack-notify@b24d75fe0e728a4bf9fc42ee217caa686d141ee8
-        env:
-          SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
-          SLACK_ICON: https://pbs.twimg.com/profile_images/1274014582265298945/OjBKP9kn_400x400.png
-          SLACK_COLOR: ${{ needs.build-linux.result }}
-          SLACK_MESSAGE: "Build finished with status ${{ needs.build-linux.result }}. (${{ env.ACTION_RUN_URL }})"
-          SLACK_USERNAME: ${{ secrets.BOT_USERNAME }}
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
-
   stop-runner-linux:
-    name: Stop EC2 runner
+    name: Stop EC2 runner (Linux)
     needs: [build-linux, start-runner-linux]
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 2
     if: ${{ always() && (needs.start-runner-linux.result != 'skipped') }}
     steps:
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@010d0da01d0b5a38af31e9c3470dbfdabdecca3a
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Stop EC2 runner python 38
-        uses: machulav/ec2-github-runner@4e0303de215db88e1c489e07a15ca4d867f488ea
+      - name: Stop EC2 runner python 3.8
+        uses: machulav/ec2-github-runner@1827d6ca7544d7044ddbd2e9360564651b463da2
         if: ${{ always() && needs.start-runner-linux.outputs.ec2-instance-id-38 }}
         with:
           github-token: ${{ secrets.EC2_RUNNER_BOT_TOKEN }}
@@ -979,8 +1070,8 @@ jobs:
           ec2-instance-id: ${{ needs.start-runner-linux.outputs.ec2-instance-id-38 }}
           mode: stop
 
-      - name: Stop EC2 runner python 39
-        uses: machulav/ec2-github-runner@4e0303de215db88e1c489e07a15ca4d867f488ea
+      - name: Stop EC2 runner python 3.9
+        uses: machulav/ec2-github-runner@1827d6ca7544d7044ddbd2e9360564651b463da2
         if: ${{ always() && needs.start-runner-linux.outputs.ec2-instance-id-39 }}
         with:
           github-token: ${{ secrets.EC2_RUNNER_BOT_TOKEN }}
@@ -988,8 +1079,8 @@ jobs:
           ec2-instance-id: ${{ needs.start-runner-linux.outputs.ec2-instance-id-39 }}
           mode: stop
 
-      - name: Stop EC2 runner python 310
-        uses: machulav/ec2-github-runner@4e0303de215db88e1c489e07a15ca4d867f488ea
+      - name: Stop EC2 runner python 3.10
+        uses: machulav/ec2-github-runner@1827d6ca7544d7044ddbd2e9360564651b463da2
         if: ${{ always() && needs.start-runner-linux.outputs.ec2-instance-id-310 }}
         with:
           github-token: ${{ secrets.EC2_RUNNER_BOT_TOKEN }}
@@ -997,10 +1088,31 @@ jobs:
           ec2-instance-id: ${{ needs.start-runner-linux.outputs.ec2-instance-id-310 }}
           mode: stop
 
-  build-macos:
-    needs: [matrix-preparation]
-    if: ${{ needs.matrix-preparation.outputs.macos-matrix != '[]' }}
+      - name: Stop EC2 runner python 3.11
+        uses: machulav/ec2-github-runner@1827d6ca7544d7044ddbd2e9360564651b463da2
+        if: ${{ always() && needs.start-runner-linux.outputs.ec2-instance-id-311 }}
+        with:
+          github-token: ${{ secrets.EC2_RUNNER_BOT_TOKEN }}
+          label: ${{ needs.start-runner-linux.outputs.label-311 }}
+          ec2-instance-id: ${{ needs.start-runner-linux.outputs.ec2-instance-id-311 }}
+          mode: stop
 
+      - name: Stop EC2 runner python 3.12
+        uses: machulav/ec2-github-runner@1827d6ca7544d7044ddbd2e9360564651b463da2
+        if: ${{ always() && needs.start-runner-linux.outputs.ec2-instance-id-312 }}
+        with:
+          github-token: ${{ secrets.EC2_RUNNER_BOT_TOKEN }}
+          label: ${{ needs.start-runner-linux.outputs.label-312 }}
+          ec2-instance-id: ${{ needs.start-runner-linux.outputs.ec2-instance-id-312 }}
+          mode: stop
+
+  build-macos-intel:
+    name: Python ${{ matrix.python_version }} (macOS, intel)
+    needs: [matrix-preparation]
+    # macOS (intel) build is currently broken so there is not need to test it until Concrete fixes it
+    # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4428
+    # if: ${{ needs.matrix-preparation.outputs.macos-matrix != '[]' }}
+    if: false
     runs-on: ${{ matrix.runs_on }}
     defaults:
       run:
@@ -1009,8 +1121,6 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(format('{{"include":{0}}}', needs.matrix-preparation.outputs.macos-matrix)) }}
     env:
-      PIP_INDEX_URL: ${{ secrets.PIP_INDEX_URL }}
-      PIP_EXTRA_INDEX_URL: ${{ secrets.PIP_EXTRA_INDEX_URL }}
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
     steps:
@@ -1018,24 +1128,23 @@ jobs:
         run: |
           echo "::add-mask::${{ secrets.INTERNAL_PYPI_URL_FOR_MASK }}"
           echo "::add-mask::${{ secrets.INTERNAL_REPO_URL_FOR_MASK }}"
-    
+
       # By default, `git clone` downloads all LFS files, which we want to avoid in CIs
       - name: Disable LFS download by default
         run: |
           git lfs install --skip-smudge
- 
+
       # Checkout the code
       - name: Checkout Code
-        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
-      
-      # Pull the only LFS files needed for regular tests, avoiding to download files stored for 
-      # benchmarks and use cases 
-      - name: Pull LFS test files
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      # Pull necessary LFS files (and thus avoid downloading files stored for benchmarks, use cases, ...)
+      - name: Pull LFS files
         run: |
-          git lfs pull --include "tests/data" --exclude  ""
+          git lfs pull --include "tests/data/**, src/concrete/ml/pandas/_client_server_files/**" --exclude  ""
 
       - name: Set up Python ${{ matrix.python_version }}
-        uses: actions/setup-python@65d7f2d534ac1bc67fcd62888c5f4f3d2cb2b236
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b
         with:
           python-version: ${{ matrix.python_version }}
 
@@ -1074,12 +1183,44 @@ jobs:
       # macOS builds are already long, so we decide not to use --weekly on them, it could be
       # changed. Remark also that, for mac, due to unexpected issues with GitHub, we have a
       # slightly different way to launch pytest
+      # Add support for re-running flaky tests on macOS (intel) CI
+      # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4428
       - name: PyTest Source Code
         run: |
           make pytest_macOS_for_GitHub
 
-  send-report:
-    if: ${{ always() }}
+  decide-slack-report:
+    name: Decide Slack report
+    runs-on: ubuntu-24.04
+    outputs:
+      send_slack_report: ${{ steps.set-decision.outputs.send_slack_report }}
+    steps:
+      - name: Set decision
+        id: set-decision
+        run: |
+          SEND_SLACK_REPORT="${{ fromJSON(env.IS_WEEKLY) || fromJSON(env.IS_PUSH_TO_MAIN) || fromJSON(env.IS_PUSH_TO_RELEASE) }}"
+
+          echo "Send Slack report:"
+          echo "${SEND_SLACK_REPORT}"
+
+          echo "send_slack_report=${SEND_SLACK_REPORT}" >> $GITHUB_OUTPUT
+
+
+  # Only send a report for the following CI:
+  # - when pushing to main
+  # - when pushing to a release branch
+  # - when running weekly tests
+  # In these cases, we want to send the report whenever one of the step was triggered, which is
+  # basically when the `matrix-preparation` has not been skipped
+  # Side note: environmental variables cannot be used for jobs conditions, so we need to determine
+  # if the job should be run or not in an previous job and store it in its output
+  slack-report:
+    name: Slack report
+    runs-on: ubuntu-24.04
+    if: |
+      always()
+      && needs.matrix-preparation.result != 'skipped'
+      && fromJSON(needs.decide-slack-report.outputs.send_slack_report)
     timeout-minutes: 2
     needs:
       [
@@ -1087,17 +1228,14 @@ jobs:
         start-runner-linux,
         build-linux,
         stop-runner-linux,
-        build-macos,
+        build-macos-intel,
+        decide-slack-report,
       ]
 
-    name: Send Slack notification
-    runs-on: ubuntu-20.04
     steps:
-      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Prepare whole job status
-        if: ${{ always() }}
-        continue-on-error: true
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
@@ -1106,20 +1244,97 @@ jobs:
           --needs_context_json /tmp/needs_context.json)
           echo "JOB_STATUS=${JOB_STATUS}" >> "$GITHUB_ENV"
 
-      - name: Slack Notification
-        if: ${{ always() }}
-        continue-on-error: true
-        uses: rtCamp/action-slack-notify@b24d75fe0e728a4bf9fc42ee217caa686d141ee8
+      - name: Set message title
+        run: |
+          if [[ "${{ env.IS_WEEKLY }}" == "true" ]]; then
+            TITLE_START="Weekly Tests"
+          elif [[ "${{ fromJSON(env.IS_PUSH_TO_MAIN) || fromJSON(env.IS_PUSH_TO_RELEASE) }}" == "true" ]]; then
+            TITLE_START="Push to '${{ github.ref_name }}'"
+          fi
+
+          if [[ "${{ env.JOB_STATUS }}" == "success" ]]; then
+            TITLE_STATUS="passed ✅"
+          elif [[ "${{ env.JOB_STATUS }}" == "cancelled" ]]; then
+            TITLE_STATUS="cancelled :black_square_for_stop:"
+          elif [[ "${{ env.JOB_STATUS }}" == "skipped" ]]; then
+            TITLE_STATUS="skipped :fast_forward:"
+          else
+            TITLE_STATUS="failed ❌"
+          fi
+
+          echo "SLACK_TITLE=${TITLE_START} ${TITLE_STATUS}" >> "$GITHUB_ENV"
+
+      # Retrieve the list of flaky tests that have been re-run if they were some
+      # Enable 'merge-multiple' to download all files in the root directory
+      - name: Download artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          merge-multiple: true
+          pattern: failed_flaky_*
+
+      # Add support for re-running flaky tests on macOS (intel) CI
+      # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4428
+      - name: Set message body
+        run: |
+          {
+            echo "SLACK_BODY<<EOF"
+            echo "Build status ([Action URL](${{ env.ACTION_RUN_URL }})):"
+            echo "  - Linux: ${{ needs.build-linux.result }}"
+            echo "  - macOS (intel): ${{ needs.build-macos-intel.result }}"
+          } >> "$GITHUB_ENV"
+
+          LINUX_PYTHON_VERSIONS="${{ needs.matrix-preparation.outputs.linux-python-versions }}"
+
+          for linux_python_version in ${LINUX_PYTHON_VERSIONS}; do
+            file_name="failed_tests_slack_list_${linux_python_version}.txt"
+
+            if [ -f ${file_name} ]; then
+              FAILED_TESTS_LIST=$(cat "${file_name}")
+
+              {
+                echo "Linux (Python ${linux_python_version}):"
+                echo "${FAILED_TESTS_LIST}"
+              } >> "$GITHUB_ENV"
+            fi
+          done
+
+          echo "EOF" >> "$GITHUB_ENV"
+
+      - name: Send Slack report
+        uses: rtCamp/action-slack-notify@c33737706dea87cd7784c687dadc9adf1be59990
         env:
           SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
           SLACK_ICON: https://pbs.twimg.com/profile_images/1274014582265298945/OjBKP9kn_400x400.png
           SLACK_COLOR: ${{ env.JOB_STATUS || 'failure' }}
-          SLACK_MESSAGE: "Full run finished with status ${{ env.JOB_STATUS || 'failure' }} \
-            (${{ env.ACTION_RUN_URL }})\n\
-            - matrix-preparation: ${{ needs.matrix-preparation.result || 'Did not run.'}}\n\n\
-            - start-runner-linux: ${{ needs.start-runner-linux.result || 'Did not run.'}}\n\n\
-            - build-linux: ${{ needs.build-linux.result || 'Did not run.' }}\n\n\
-            - stop-runner-linux: ${{ needs.stop-runner-linux.result || 'Did not run.'}}\n\n\
-            - build-macos: ${{ needs.build-macos.result || 'Did not run.' }}"
+          SLACK_TITLE: ${{ env.SLACK_TITLE || 'Unexpected CI' }}
+          SLACK_MESSAGE: ${{ env.SLACK_BODY || 'Unexpected CI' }}
+          SLACK_USERNAME: ${{ secrets.BOT_USERNAME }}
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+          SLACKIFY_MARKDOWN: true
+
+
+  stop-ec2-failure-slack-alert:
+    name: Stop EC2 failure Slack alert
+    runs-on: ubuntu-24.04
+    if: |
+      always() 
+      && needs.matrix-preparation.result != 'skipped' 
+      && needs.stop-runner-linux.result == 'failure'
+    timeout-minutes: 2
+    needs:
+      [
+        matrix-preparation,
+        stop-runner-linux,
+      ]
+
+    steps:
+      - name: Send stop EC2 failure Slack alert
+        uses: rtCamp/action-slack-notify@c33737706dea87cd7784c687dadc9adf1be59990
+        env:
+          SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
+          SLACK_ICON: https://pbs.twimg.com/profile_images/1274014582265298945/OjBKP9kn_400x400.png
+          SLACK_COLOR: 'failure'
+          SLACK_TITLE: 'Stopping EC2 instances (linux) failed ❌'
+          SLACK_MESSAGE: '<!channel> EC2 instances must be terminated manually as soon as possible'
           SLACK_USERNAME: ${{ secrets.BOT_USERNAME }}
           SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}

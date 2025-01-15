@@ -1,5 +1,6 @@
 """Implement DecisionTree models."""
-from typing import Any, Dict
+
+from typing import Any, Dict, Union
 
 import numpy
 import sklearn.tree
@@ -31,7 +32,8 @@ class DecisionTreeClassifier(BaseTreeClassifierMixin):
         min_impurity_decrease=0.0,
         class_weight=None,
         ccp_alpha: float = 0.0,
-        n_bits: int = 6,
+        monotonic_cst=None,
+        n_bits: Union[int, Dict[str, int]] = 6,
     ):
         """Initialize the DecisionTreeClassifier.
 
@@ -53,6 +55,7 @@ class DecisionTreeClassifier(BaseTreeClassifierMixin):
         self.random_state = random_state
         self.min_impurity_decrease = min_impurity_decrease
         self.ccp_alpha = ccp_alpha
+        self.monotonic_cst = monotonic_cst
 
     def __getattr__(self, attr: str):
         # We directly expose the following methods as they are commonly used with decision trees
@@ -74,7 +77,7 @@ class DecisionTreeClassifier(BaseTreeClassifierMixin):
     def dump_dict(self) -> Dict[str, Any]:
         metadata: Dict[str, Any] = {}
 
-        # Concrete-ML
+        # Concrete ML
         metadata["n_bits"] = self.n_bits
         metadata["sklearn_model"] = self.sklearn_model
         metadata["_is_fitted"] = self._is_fitted
@@ -84,6 +87,7 @@ class DecisionTreeClassifier(BaseTreeClassifierMixin):
         metadata["onnx_model_"] = self.onnx_model_
         metadata["framework"] = self.framework
         metadata["post_processing_params"] = self.post_processing_params
+        metadata["_fhe_ensembling"] = self._fhe_ensembling
 
         # Scikit-Learn
         metadata["criterion"] = self.criterion
@@ -98,6 +102,7 @@ class DecisionTreeClassifier(BaseTreeClassifierMixin):
         metadata["random_state"] = self.random_state
         metadata["min_impurity_decrease"] = self.min_impurity_decrease
         metadata["ccp_alpha"] = self.ccp_alpha
+        metadata["monotonic_cst"] = self.monotonic_cst
 
         return metadata
 
@@ -107,18 +112,22 @@ class DecisionTreeClassifier(BaseTreeClassifierMixin):
         # Instantiate the model
         obj = cls(n_bits=metadata["n_bits"])
 
-        # Concrete-ML
+        # Concrete ML
         obj.sklearn_model = metadata["sklearn_model"]
         obj._is_fitted = metadata["_is_fitted"]
         obj._is_compiled = metadata["_is_compiled"]
         obj.input_quantizers = metadata["input_quantizers"]
         obj.framework = metadata["framework"]
-        obj._tree_inference, obj.output_quantizers, obj.onnx_model_ = tree_to_numpy(
+        obj.onnx_model_ = metadata["onnx_model_"]
+        obj.output_quantizers = metadata["output_quantizers"]
+        obj._fhe_ensembling = metadata["_fhe_ensembling"]
+        obj._tree_inference = tree_to_numpy(
             obj.sklearn_model,
             numpy.zeros((len(obj.input_quantizers),))[None, ...],
             framework=obj.framework,
-            output_n_bits=obj.n_bits,
-        )
+            output_n_bits=obj.n_bits["op_leaves"] if isinstance(obj.n_bits, Dict) else obj.n_bits,
+            fhe_ensembling=obj._fhe_ensembling,
+        )[0]
         obj.post_processing_params = metadata["post_processing_params"]
 
         # Scikit-Learn
@@ -134,6 +143,7 @@ class DecisionTreeClassifier(BaseTreeClassifierMixin):
         obj.random_state = metadata["random_state"]
         obj.min_impurity_decrease = metadata["min_impurity_decrease"]
         obj.ccp_alpha = metadata["ccp_alpha"]
+        obj.monotonic_cst = metadata["monotonic_cst"]
 
         return obj
 
@@ -160,7 +170,8 @@ class DecisionTreeRegressor(BaseTreeRegressorMixin):
         max_leaf_nodes=None,
         min_impurity_decrease=0.0,
         ccp_alpha=0.0,
-        n_bits: int = 6,
+        monotonic_cst=None,
+        n_bits: Union[int, Dict[str, int]] = 6,
     ):
         """Initialize the DecisionTreeRegressor.
 
@@ -181,6 +192,7 @@ class DecisionTreeRegressor(BaseTreeRegressorMixin):
         self.random_state = random_state
         self.min_impurity_decrease = min_impurity_decrease
         self.ccp_alpha = ccp_alpha
+        self.monotonic_cst = monotonic_cst
 
     def __getattr__(self, attr: str):
         # We directly expose the following methods as they are commonly used with decision trees
@@ -196,7 +208,7 @@ class DecisionTreeRegressor(BaseTreeRegressorMixin):
     def dump_dict(self) -> Dict[str, Any]:
         metadata: Dict[str, Any] = {}
 
-        # Concrete-ML
+        # Concrete ML
         metadata["n_bits"] = self.n_bits
         metadata["sklearn_model"] = self.sklearn_model
         metadata["_is_fitted"] = self._is_fitted
@@ -206,6 +218,7 @@ class DecisionTreeRegressor(BaseTreeRegressorMixin):
         metadata["onnx_model_"] = self.onnx_model_
         metadata["framework"] = self.framework
         metadata["post_processing_params"] = self.post_processing_params
+        metadata["_fhe_ensembling"] = self._fhe_ensembling
 
         # Scikit-Learn
         metadata["criterion"] = self.criterion
@@ -219,6 +232,7 @@ class DecisionTreeRegressor(BaseTreeRegressorMixin):
         metadata["random_state"] = self.random_state
         metadata["min_impurity_decrease"] = self.min_impurity_decrease
         metadata["ccp_alpha"] = self.ccp_alpha
+        metadata["monotonic_cst"] = self.monotonic_cst
 
         return metadata
 
@@ -228,18 +242,23 @@ class DecisionTreeRegressor(BaseTreeRegressorMixin):
         # Instantiate the model
         obj = cls(n_bits=metadata["n_bits"])
 
-        # Concrete-ML
+        # Concrete ML
         obj.sklearn_model = metadata["sklearn_model"]
         obj._is_fitted = metadata["_is_fitted"]
+        obj._fhe_ensembling = metadata["_fhe_ensembling"]
         obj._is_compiled = metadata["_is_compiled"]
         obj.input_quantizers = metadata["input_quantizers"]
         obj.framework = metadata["framework"]
-        obj._tree_inference, obj.output_quantizers, obj.onnx_model_ = tree_to_numpy(
+        obj.onnx_model_ = metadata["onnx_model_"]
+        obj.output_quantizers = metadata["output_quantizers"]
+        obj._fhe_ensembling = metadata["_fhe_ensembling"]
+        obj._tree_inference = tree_to_numpy(
             obj.sklearn_model,
             numpy.zeros((len(obj.input_quantizers),))[None, ...],
             framework=obj.framework,
-            output_n_bits=obj.n_bits,
-        )
+            output_n_bits=obj.n_bits["op_leaves"] if isinstance(obj.n_bits, Dict) else obj.n_bits,
+            fhe_ensembling=obj._fhe_ensembling,
+        )[0]
         obj.post_processing_params = metadata["post_processing_params"]
 
         # Scikit-Learn
@@ -254,5 +273,6 @@ class DecisionTreeRegressor(BaseTreeRegressorMixin):
         obj.random_state = metadata["random_state"]
         obj.min_impurity_decrease = metadata["min_impurity_decrease"]
         obj.ccp_alpha = metadata["ccp_alpha"]
+        obj.monotonic_cst = metadata["monotonic_cst"]
 
         return obj

@@ -1,4 +1,5 @@
 """Update list of supported functions in the doc."""
+
 import argparse
 from pathlib import Path
 
@@ -53,7 +54,7 @@ def main(file_to_update):
 
     # This code is seen as a duplicate with other scripts we have
     # pylint: disable=duplicate-code
-    if args.check:
+    if args.check:  # pylint: disable=possibly-used-before-assignment
 
         with open(file_to_update, "r", encoding="utf-8") as file:
             oldlines = file.readlines()
@@ -61,7 +62,7 @@ def main(file_to_update):
         assert (
             oldlines == newlines
         ), "List of supported functions is not up to date. Please run `make supported_ops`. "
-    # pylint: disable=duplicate-code
+    # pylint: enable=duplicate-code
 
     else:
         with open(file_to_update, "w", encoding="utf-8") as file:
