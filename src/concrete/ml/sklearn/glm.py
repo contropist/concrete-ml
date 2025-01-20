@@ -1,10 +1,12 @@
 """Implement sklearn's Generalized Linear Models (GLM)."""
+
 from __future__ import annotations
 
 from abc import abstractmethod
 from typing import Any, Dict, Union
 
 import numpy
+import sklearn
 import sklearn.linear_model
 
 from ..common.debugging.custom_assert import assert_true
@@ -81,7 +83,7 @@ class _GeneralizedLinearRegressor(SklearnLinearRegressorMixin):
 
         metadata: Dict[str, Any] = {}
 
-        # Concrete-ML
+        # Concrete ML
         metadata["n_bits"] = self.n_bits
         metadata["sklearn_model"] = self.sklearn_model
         metadata["_is_fitted"] = self._is_fitted
@@ -111,7 +113,7 @@ class _GeneralizedLinearRegressor(SklearnLinearRegressorMixin):
         # Instantiate the model
         obj = cls(n_bits=metadata["n_bits"])
 
-        # Concrete-ML
+        # Concrete ML
         obj.n_bits = metadata["n_bits"]
         obj.sklearn_model = metadata["sklearn_model"]
         obj.onnx_model_ = metadata["onnx_model_"]
@@ -135,6 +137,19 @@ class _GeneralizedLinearRegressor(SklearnLinearRegressorMixin):
 
         return obj
 
+    def get_sklearn_params(self, deep: bool = True) -> dict:
+        # Here, the `get_params` method is the `BaseEstimator.get_params` method from scikit-learn
+        # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/3373
+        params = super().get_params(deep=deep)  # type: ignore[misc]
+
+        # Remove the parameters added by Concrete ML
+        params.pop("n_bits", None)
+        # Remove sklearn 1.5 parameter when using sklearn 1.1
+        if "1.1." in sklearn.__version__:
+            params.pop("solver", None)  # pragma: no cover
+
+        return params
+
 
 class PoissonRegressor(_GeneralizedLinearRegressor):
     """A Poisson regression model with FHE.
@@ -155,12 +170,13 @@ class PoissonRegressor(_GeneralizedLinearRegressor):
     sklearn_model_class = sklearn.linear_model.PoissonRegressor
     _is_a_public_cml_model = True
 
-    def __init__(
+    def __init__(  # pylint: disable=useless-parent-delegation
         self,
         *,
         n_bits: Union[int, dict] = 8,
         alpha: float = 1.0,
         fit_intercept: bool = True,
+        solver="lbfgs",
         max_iter: int = 100,
         tol: float = 1e-4,
         warm_start: bool = False,
@@ -170,6 +186,7 @@ class PoissonRegressor(_GeneralizedLinearRegressor):
             n_bits=n_bits,
             alpha=alpha,
             fit_intercept=fit_intercept,
+            solver=solver,
             max_iter=max_iter,
             tol=tol,
             warm_start=warm_start,
@@ -199,12 +216,13 @@ class GammaRegressor(_GeneralizedLinearRegressor):
     sklearn_model_class = sklearn.linear_model.GammaRegressor
     _is_a_public_cml_model = True
 
-    def __init__(
+    def __init__(  # pylint: disable=useless-parent-delegation
         self,
         *,
         n_bits: Union[int, dict] = 8,
         alpha: float = 1.0,
         fit_intercept: bool = True,
+        solver="lbfgs",
         max_iter: int = 100,
         tol: float = 1e-4,
         warm_start: bool = False,
@@ -214,6 +232,7 @@ class GammaRegressor(_GeneralizedLinearRegressor):
             n_bits=n_bits,
             alpha=alpha,
             fit_intercept=fit_intercept,
+            solver=solver,
             max_iter=max_iter,
             tol=tol,
             warm_start=warm_start,
@@ -244,7 +263,7 @@ class TweedieRegressor(_GeneralizedLinearRegressor):
     sklearn_model_class = sklearn.linear_model.TweedieRegressor
     _is_a_public_cml_model = True
 
-    def __init__(
+    def __init__(  # pylint: disable=too-many-arguments
         self,
         *,
         n_bits: Union[int, dict] = 8,
@@ -252,6 +271,7 @@ class TweedieRegressor(_GeneralizedLinearRegressor):
         alpha: float = 1.0,
         fit_intercept: bool = True,
         link: str = "auto",
+        solver="lbfgs",
         max_iter: int = 100,
         tol: float = 1e-4,
         warm_start: bool = False,
@@ -261,6 +281,7 @@ class TweedieRegressor(_GeneralizedLinearRegressor):
             n_bits=n_bits,
             alpha=alpha,
             fit_intercept=fit_intercept,
+            solver=solver,
             max_iter=max_iter,
             tol=tol,
             warm_start=warm_start,
@@ -306,7 +327,7 @@ class TweedieRegressor(_GeneralizedLinearRegressor):
 
         metadata: Dict[str, Any] = {}
 
-        # Concrete-ML
+        # Concrete ML
         metadata["n_bits"] = self.n_bits
         metadata["sklearn_model"] = self.sklearn_model
         metadata["_is_fitted"] = self._is_fitted
@@ -324,7 +345,6 @@ class TweedieRegressor(_GeneralizedLinearRegressor):
         # Scikit-Learn
         metadata["alpha"] = self.alpha
         metadata["fit_intercept"] = self.fit_intercept
-        metadata["solver"] = self.solver
         metadata["max_iter"] = self.max_iter
         metadata["tol"] = self.tol
         metadata["warm_start"] = self.warm_start
@@ -338,7 +358,7 @@ class TweedieRegressor(_GeneralizedLinearRegressor):
         # Instantiate the model
         obj = cls(n_bits=metadata["n_bits"])
 
-        # Concrete-ML
+        # Concrete ML
         obj.sklearn_model = metadata["sklearn_model"]
         obj.onnx_model_ = metadata["onnx_model_"]
         obj._is_fitted = metadata["_is_fitted"]
@@ -355,7 +375,6 @@ class TweedieRegressor(_GeneralizedLinearRegressor):
         # Scikit-Learn
         obj.alpha = metadata["alpha"]
         obj.fit_intercept = metadata["fit_intercept"]
-        obj.solver = metadata["solver"]
         obj.max_iter = metadata["max_iter"]
         obj.tol = metadata["tol"]
         obj.warm_start = metadata["warm_start"]

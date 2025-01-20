@@ -8,6 +8,7 @@ from typing import Any, Dict, Optional, Tuple, Union
 import numpy as np
 import pandas
 import py_progress_tracker as progress
+import sklearn
 from common import (
     BENCHMARK_CONFIGURATION,
     GLMS_STRING_TO_CLASS,
@@ -27,6 +28,10 @@ from sklearn.preprocessing import (
     KBinsDiscretizer,
     OneHotEncoder,
     StandardScaler,
+)
+
+sklearn_sparse_arg = (
+    {"sparse": False} if "1.1." in sklearn.__version__ else {"sparse_output": False}
 )
 
 
@@ -102,7 +107,7 @@ def get_preprocessor() -> ColumnTransformer:
             ("log_scaled_numeric", log_scale_transformer, ["Density"]),
             (
                 "onehot_categorical",
-                OneHotEncoder(sparse=False),
+                OneHotEncoder(**sklearn_sparse_arg),
                 ["VehBrand", "VehPower", "VehGas", "Region", "Area"],
             ),
         ],
@@ -113,14 +118,20 @@ def get_preprocessor() -> ColumnTransformer:
 
 def get_train_test_data(data: pandas.DataFrame) -> Tuple[pandas.DataFrame, pandas.DataFrame]:
     """Split the data into a train and test set."""
-    train_data, test_data, = train_test_split(
+    (
+        train_data,
+        test_data,
+    ) = train_test_split(
         data,
         test_size=0.2,
         random_state=0,
     )
 
     # The test set is reduced for faster FHE runs.
-    _, test_data, = train_test_split(
+    (
+        _,
+        test_data,
+    ) = train_test_split(
         test_data,
         test_size=500,
         random_state=0,
@@ -210,8 +221,8 @@ def get_config(args: argparse.Namespace) -> Dict[str, Any]:
         n_bits_list = args.n_bits
     else:  # Default
         try:  # For backward compatibility
-            # pylint: disable-next=unused-import,import-outside-toplevel
             # flake8: noqa: F401,C0415
+            # pylint: disable-next=unused-import,import-outside-toplevel
             from concrete.ml.quantization.base_quantized_op import DEFAULT_MODEL_BITS
 
             n_bits_list = [

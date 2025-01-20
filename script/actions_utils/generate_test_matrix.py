@@ -21,6 +21,8 @@ class PythonVersion(enum.Enum):
     V_3_8 = "3.8"
     V_3_9 = "3.9"
     V_3_10 = "3.10"
+    V_3_11 = "3.11"
+    V_3_12 = "3.12"
 
 
 class OS(enum.Enum):
@@ -30,6 +32,8 @@ class OS(enum.Enum):
     MACOS = "macos"
 
 
+# Add mac silicon
+# FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4010
 OS_VERSIONS = {
     OS.LINUX: "ubuntu-20.04",
     OS.MACOS: "macos-12",

@@ -1,7 +1,7 @@
 """Some code to manipulate models."""
 
 from copy import deepcopy
-from typing import Iterable, List
+from typing import Iterable, List, Optional, Tuple
 
 import onnx
 
@@ -163,35 +163,91 @@ def remove_node_types(onnx_model: onnx.ModelProto, op_types_to_remove: List[str]
 def clean_graph_at_node_op_type(
     onnx_model: onnx.ModelProto, node_op_type: str, fail_if_not_found: bool = True
 ):
-    """Clean the graph of the onnx model by removing nodes at the given node type.
+    """Remove the first node matching node_op_type and its following nodes from the ONNX graph.
 
-    Note: the specified node_type is also removed.
+    Args:
+        onnx_model (onnx.ModelProto): The onnx model.
+        node_op_type (str): The node's op_type whose following nodes as well as itself will be
+            removed.
+        fail_if_not_found (bool): If true, raise an error if no node matched the given op_type.
+
+    Raises:
+        ValueError: If no node matched the given op_type and fail_if_not_found is set to True
+    """
+    # Get the list of node that matches the given operator type
+    nodes_of_type = [node for node in onnx_model.graph.node if node.op_type == node_op_type]
+
+    if nodes_of_type:
+
+        # Get the (first) input's same of the first node that matches the given operator type
+        input_name = nodes_of_type[0].input[0]
+
+        # Find the node that has the input_name as output name (i.e., the node tha precedes the
+        # selected node) and retrieve its name
+        node_to_cut = next(node for node in onnx_model.graph.node if node.output[0] == input_name)
+        node_to_cut_name = node_to_cut.name
+
+        _clean_graph_at_node_name(
+            onnx_model, node_name=node_to_cut_name, fail_if_not_found=fail_if_not_found
+        )
+
+    elif fail_if_not_found:  # pragma: no cover
+        raise ValueError(  # pragma: no cover
+            f"Node of type '{node_op_type}' could not be found within the ONNX graph"
+        )
+
+
+def clean_graph_after_node_op_type(
+    onnx_model: onnx.ModelProto, node_op_type: str, fail_if_not_found: bool = True
+):
+    """Remove the nodes following first node matching node_op_type from the ONNX graph.
 
     Args:
         onnx_model (onnx.ModelProto): The onnx model.
         node_op_type (str): The node's op_type whose following nodes will be removed.
-        fail_if_not_found (bool): If true, abort if the node op_type is not found
+        fail_if_not_found (bool): If true, raise an error if no node matched the given op_type.
 
     Raises:
-        ValueError: if fail_if_not_found is set
+        ValueError: If no node matched the given op_type and fail_if_not_found is set to True
     """
+    # Get the list of node that matches the given operator type
+    nodes_of_type = [node for node in onnx_model.graph.node if node.op_type == node_op_type]
 
-    target_node_list = [node for node in onnx_model.graph.node if node.op_type == node_op_type]
-    assert_true(
-        len(target_node_list) == 1,
-        "Multiple ReduceSum nodes found which is unexpected in tree-based models",
-    )
+    if node_op_type:
 
-    target_node = target_node_list[0]
+        # Get the first node that matches the given operator type and retrieve its name
+        node_to_cut_name = nodes_of_type[0].name
 
-    # Get the input to ReduceSum where index 0 is the data
-    input_name = target_node.input[0]
+        _clean_graph_at_node_name(
+            onnx_model, node_name=node_to_cut_name, fail_if_not_found=fail_if_not_found
+        )
 
-    # Find the node that has the input_name as output name
-    node_to_cut = next(node for node in onnx_model.graph.node if node.output[0] == input_name)
-    node_name = node_to_cut.name
+    elif fail_if_not_found:  # pragma: no cover
+        raise ValueError(  # pragma: no cover
+            f"Node of type '{node_op_type}' could not be found within the ONNX graph"
+        )
+
+
+def _clean_graph_at_node_name(
+    onnx_model: onnx.ModelProto, node_name: str, fail_if_not_found: bool = True
+):
+    """Remove the first node matching node_name and its following nodes from the ONNX graph.
+
+    Args:
+        onnx_model (onnx.ModelProto): The onnx model.
+        node_name (str): The node's name whose following nodes as well as itself will be removed.
+        fail_if_not_found (bool): If true, raise an error if no node matched the given name.
+
+    Raises:
+        ValueError: If no node matched the given name and fail_if_not_found is set to True
+    """
+    # Build a dictionary associating all initializers with their names
+    initializers_name_to_instance = {
+        initializer.name: initializer for initializer in onnx_model.graph.initializer
+    }
 
     nodes_to_remove = []
+    initializers_to_remove = []
     output_to_follow = "variable"
     op_reached = False
 
@@ -202,7 +258,12 @@ def clean_graph_at_node_op_type(
         if op_reached:
             nodes_to_remove.append(node)
 
-        # ELse, if the current node represents the operator, retrieve its output node
+            # If one of the node's inputs is an initializer, store the initializer
+            for node_input_name in node.input:
+                if node_input_name in initializers_name_to_instance:
+                    initializers_to_remove.append(initializers_name_to_instance[node_input_name])
+
+        # Else, if the current node represents the operator, retrieve its output node
         elif node.name == node_name:
             op_reached = True
 
@@ -212,58 +273,120 @@ def clean_graph_at_node_op_type(
             )
             output_to_follow = node.output[0]
 
-    # Once the graph has been covered and a operator was found, remove its its following nodes
+    # If the graph has been covered and an operator to remove has been found, remove it and its
+    # following nodes as well as the initializers they used as inputs
     if op_reached:
         for node in nodes_to_remove:
             onnx_model.graph.node.remove(node)
+
+        for initializer in initializers_to_remove:
+            onnx_model.graph.initializer.remove(initializer)
+
     elif fail_if_not_found:  # pragma: no cover
-        raise ValueError(f"Error, can't find {node_name}")  # pragma: no cover
+        raise ValueError(  # pragma: no cover
+            f"Node '{node_name}' could not be found within the ONNX graph"
+        )
 
     # Keep the output node
     keep_following_outputs_discard_others(onnx_model, [output_to_follow])
 
 
-def clean_graph_after_node_op_type(
-    onnx_model: onnx.ModelProto, node_op_type: str, fail_if_not_found: bool = True
-):
-    """Clean the graph of the onnx model by removing nodes after the given node type.
+# FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4532
+# Function to convert the first Gather nodes
+# to matrix multiplications with one-hot encoding as a pre-processing step
+def convert_first_gather_to_matmul(
+    onnx_model: onnx.ModelProto,
+) -> Tuple[Optional[onnx.ModelProto], onnx.ModelProto]:
+    """Convert the first Gather node to a matrix multiplication node.
+
+    In FHE, Gather is a costly operation since it can involve many PBS.
+    When it appears first in the onnx model, we can remove it and replace it by a matrix
+    multiplication node by converting the indices to a one-hot encoding.
 
     Args:
         onnx_model (onnx.ModelProto): The onnx model.
-        node_op_type (str): The node's op_type whose following nodes will be removed.
-        fail_if_not_found (bool): If true, abort if the node op_type is not found
 
-    Raises:
-        ValueError: if the node op_type is not found and if fail_if_not_found is set
-
+    Returns:
+        Tuple[Optional[onnx.ModelProto], onnx.ModelProto]: The pre-processing model and the modified
+            onnx model.
     """
-    nodes_to_remove = []
-    output_to_follow = "variable"
-    op_reached = False
+    pre_processing_nodes = []
+    modified = False
+    depth_tensors = []
+    gather_depths = {}
 
-    # Find nodes to remove
     for node in onnx_model.graph.node:
+        if node.op_type == "Gather" and node.input[1] in [
+            input.name for input in onnx_model.graph.input
+        ]:
+            # Extract the inputs and output of the Gather node
+            data_input = node.input[0]
+            indices_input = node.input[1]
+            gather_output = node.output[0]
 
-        # If the operator has previously been reached, store the node
-        if op_reached:
-            nodes_to_remove.append(node)
-
-        # Else, if the current node represents the operator, retrieve its output node
-        elif node.op_type == node_op_type:
-            op_reached = True
-
-            # Create output node
-            onnx_model.graph.output[0].CopyFrom(
-                onnx.helper.make_tensor_value_info(node.output[0], onnx.TensorProto.FLOAT, [2])
+            # Find the shape of the data_input (embedding matrix)
+            data_shape_initializer = next(
+                (init for init in onnx_model.graph.initializer if init.name == data_input), None
             )
-            output_to_follow = node.output[0]
+            assert data_shape_initializer is not None, f"Shape of {data_input} not found"
 
-    # Once the graph has been covered and a operator was found, remove its its following nodes
-    if op_reached:
-        for node in nodes_to_remove:
+            # Extract the depth arg for the OneHot node using the embedding matrix
+            depth = data_shape_initializer.dims[0]
+            depth_name = f"depth_{node.name}"
+            gather_depths[node.name] = depth
+
+            # Create a node for OneHot operation
+            pre_processed_x = f"pre_processed_{indices_input}"
+            pre_processing_nodes.append(
+                onnx.helper.make_node(
+                    "OneHot",
+                    inputs=[indices_input, depth_name, "values"],
+                    outputs=[pre_processed_x],
+                )
+            )
+
+            # Store the depth tensor for this Gather node
+            depth_tensor = onnx.helper.make_tensor(depth_name, onnx.TensorProto.INT64, [1], [depth])
+            depth_tensors.append(depth_tensor)
+
+            # Replace Gather node with MatMul node
+            matmul_node = onnx.helper.make_node(
+                "MatMul", inputs=[indices_input, data_input], outputs=[gather_output]
+            )
             onnx_model.graph.node.remove(node)
-    elif fail_if_not_found:  # pragma: no cover
-        raise ValueError(f"Error, can't find {node_op_type}")  # pragma: no cover
 
-    # Keep the output node
-    keep_following_outputs_discard_others(onnx_model, [output_to_follow])
+            # Insert the new node at the beginning of the graph
+            onnx_model.graph.node.insert(0, matmul_node)
+            modified = True
+
+    if not modified:
+        return None, onnx_model
+
+    # Create a tensor for the values of the OneHot node
+    values_tensor = onnx.helper.make_tensor("values", onnx.TensorProto.FLOAT, [2], [0.0, 1.0])
+
+    # Create pre-processing graph
+    pre_processing_graph = onnx.helper.make_graph(
+        pre_processing_nodes,
+        "pre_processing_graph",
+        [
+            onnx.helper.make_tensor_value_info(node.input[0], onnx.TensorProto.INT64, [None])
+            for node in pre_processing_nodes
+        ],
+        [
+            onnx.helper.make_tensor_value_info(
+                node.output[0], onnx.TensorProto.FLOAT, [None, depth]
+            )
+            for node, depth in zip(pre_processing_nodes, gather_depths.values())
+        ],
+        depth_tensors + [values_tensor],
+    )
+
+    pre_processing_onnx = onnx.helper.make_model(
+        pre_processing_graph, opset_imports=[onnx.helper.make_opsetid("", 14)]
+    )
+
+    # Check the pre-processing onnx
+    onnx.checker.check_model(pre_processing_onnx)
+
+    return pre_processing_onnx, onnx_model

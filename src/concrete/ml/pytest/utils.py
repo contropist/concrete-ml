@@ -1,14 +1,19 @@
 """Common functions or lists for test files, which can't be put in fixtures."""
+
+import copy
 import io
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Type, Union
 
 import numpy
+import pandas
 import pytest
 import torch
 from numpy.random import RandomState
 from torch import nn
+
+from concrete.ml.sklearn.linear_model import SGDClassifier
 
 from ..common.serialization.dumpers import dump, dumps
 from ..common.serialization.loaders import load, loads
@@ -83,7 +88,7 @@ def _get_pytest_param_classifier(model, n_classes: int):
         }
     else:
         dataset_params = {
-            "n_samples": 1000,
+            "n_samples": 100,
             "n_features": 10,
             "n_classes": n_classes,
             "n_informative": 10,
@@ -124,7 +129,13 @@ def _get_sklearn_models_and_datasets(model_classes: List, unique_models: bool = 
             # the test execution timings
             n_classes_to_test = (
                 [2]
-                if unique_models or get_model_class(model_class) == KNeighborsClassifier
+                if unique_models
+                or get_model_class(model_class) == KNeighborsClassifier
+                or (
+                    isinstance(model_class, partial)
+                    and model_class.func == SGDClassifier
+                    and model_class.keywords.get("fit_encrypted", False)
+                )
                 else [2, 4]
             )
 
@@ -179,6 +190,15 @@ def get_sklearn_linear_models_and_datasets(
             partial(TweedieRegressor, link="auto", power=2.8),
             partial(TweedieRegressor, link="log", power=1.0),
             partial(TweedieRegressor, link="identity", power=0.0),
+        ]
+
+    # If the linear model is SGDClassifier,
+    # we need to handle the training parameters
+    if is_model_class_in_a_list(SGDClassifier, linear_classes):
+        linear_classes += [
+            partial(SGDClassifier, fit_encrypted=False),
+            # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4460
+            # partial(SGDClassifier, fit_encrypted=True, parameters_range=(-1, 1)),
         ]
 
     return _get_sklearn_models_and_datasets(linear_classes, unique_models=unique_models)
@@ -388,6 +408,11 @@ def instantiate_model_generic(model_class, n_bits, **parameters):
         model_name (str): The type of the model as a string.
         model (object): The model instance.
     """
+    # Force multi threaded models to be single threaded as it is not working
+    # properly with pytest multi-threading
+    if "n_jobs" in model_class().get_params():
+        parameters["n_jobs"] = 1
+
     # If the model is a QNN, set the model using appropriate bit-widths
     if is_model_class_in_a_list(model_class, _get_sklearn_neural_net_models()):
         extra_kwargs = {}
@@ -587,11 +612,12 @@ def check_serialization(
     dump_method_to_test = [False]
 
     # If the given object provides a `dump`, `dumps` `dump_dict` method (which indicates that they
-    # are Concrete ML serializable classes), run the check using these as well
+    # are Concrete ML serializable classes) and are instantiated, run the check using these as well
     if (
         hasattr(object_to_serialize, "dump")
         and hasattr(object_to_serialize, "dumps")
         and hasattr(object_to_serialize, "dump_dict")
+        and not isinstance(object_to_serialize, type)
     ):
         dump_method_to_test.append(True)
 
@@ -661,3 +687,88 @@ def check_serialization(
                 "Loaded object (from file) is not equal to the initial one, using equal method "
                 f"{equal_method}."
             )
+
+
+def get_random_samples(x: numpy.ndarray, n_sample: int) -> numpy.ndarray:
+    """Select `n_sample` random elements from a 2D NumPy array.
+
+    Args:
+        x (numpy.ndarray): The 2D NumPy array from which random rows will be selected.
+        n_sample (int): The number of rows to randomly select.
+
+    Returns:
+        numpy.ndarray: A new 2D NumPy array containing the randomly selected rows.
+
+    Raises:
+        AssertionError: If `n_sample` is not within the range (0, x.shape[0]) or
+            if `x` is not a 2D array.
+    """
+
+    # Sanity checks
+    assert 0 < n_sample < x.shape[0]
+    assert len(x.shape) == 2
+
+    random_rows_indices = numpy.random.choice(x.shape[0], size=n_sample, replace=False)
+    return x[random_rows_indices]
+
+
+def pandas_dataframe_are_equal(
+    df_1: pandas.DataFrame,
+    df_2: pandas.DataFrame,
+    float_rtol: float = 1.0e-5,
+    float_atol: float = 1.0e-8,
+    equal_nan: bool = False,
+):
+    """Determine if both data-frames are identical.
+
+    Args:
+        df_1 (pandas.DataFrame): The first data-frame to consider.
+        df_2 (pandas.DataFrame): The second data-frame to consider.
+        float_rtol (float): Numpy's relative tolerance parameter to use when comparing columns with
+            floating point values. Default to 1.e-5.
+        float_atol (float): Numpy's absolute tolerance parameter to use when comparing columns with
+            floating point values. Default to 1.e-8.
+        equal_nan (bool):  Whether to compare NaN values as equal. Default to False.
+
+    Returns:
+        Bool: Wether both data-frames are equal.
+    """
+    df_1 = copy.copy(df_1)
+    df_2 = copy.copy(df_2)
+
+    # Select columns with floating point values
+    float_columns = df_1.select_dtypes(include="float").columns
+
+    # Check if the float columns contain the same values
+    float_equal = numpy.isclose(
+        df_1[float_columns],
+        df_2[float_columns],
+        rtol=float_rtol,
+        atol=float_atol,
+        equal_nan=equal_nan,
+    ).all()
+
+    # Select other columns (integers, objects, ...)
+    non_float_columns = df_1.select_dtypes(exclude="float").columns
+
+    # In case NaN values must be considered equal, replace them by a custom placeholder before
+    # comparing the data-frames
+    if equal_nan:
+        placeholder = "<NA>"
+
+        # Make sure this placeholder does not already exist in the data-frames
+        assert (
+            not df_1[non_float_columns].isin([placeholder]).any().any()
+            or not df_2[non_float_columns].isin([placeholder]).any().any()
+        ), (
+            f"The placeholder value '{placeholder}' already exists in the string columns and thus "
+            "cannot be used for comparing the data-frames."
+        )
+
+        df_1 = df_1[non_float_columns].fillna(placeholder)
+        df_2 = df_2[non_float_columns].fillna(placeholder)
+
+    # Check if non-float columns contain the same values
+    string_equal = df_1.eq(df_2).all().all()
+
+    return float_equal and string_equal

@@ -1,19 +1,42 @@
-# Deployment
+# Deployment Examples
 
-In this folder we explain how to deploy Concrete ML models.
-We show-case how to do this on 3 examples:
+This folder contains examples of how to deploy Concrete ML models using Fully Homomorphic Encryption (FHE). These examples demonstrate the process of training, compiling, and deploying models for various use cases.
 
-- Breast cancer classification using a simple XGBoost model
-- Sentiment analysis by running a XGBoost model on top of a Transformer model
-- CIFAR-10 classification using a VGG model split in two parts.
+## Overview
 
-You can run these example locally using Docker, or on AWS if you have your credentials set up.
+The deployment process generally follows these steps:
 
-For all of them the workflow is the same:
-0\. Optional: Train the model
-
+1. Train the model (optional, depending on the use case)
 1. Compile the model to an FHE circuit
-1. Deploy to AWS, Docker or localhost
-1. Run the inference using the client (locally or in Docker)
+1. Deploy the model using Docker
+1. Run inference using a client (locally or in Docker)
 
-The script to deploy the model compiled to an FHE circuit is the same for all. The main difference between them is the client. Each use-case needs its own client.
+## Available Examples
+
+We provide three different use cases to demonstrate the deployment process:
+
+1. [Breast Cancer Classification](./breast_cancer/README.md)
+1. [Sentiment Analysis](./sentiment_analysis/README.md)
+1. [CIFAR-10 Image Classification](./cifar/README.md)
+
+## Getting Started
+
+Each example folder contains its own README with specific instructions. However, the general process is similar:
+
+1. Train or compile the model using the provided scripts
+1. Deploy the model using `deploy_to_docker.py` from the `server` folder
+1. Build the client Docker image
+1. Run the client to interact with the deployed model
+
+For detailed instructions, please refer to the README in each example folder.
+
+## Requirements
+
+- Docker
+- Python 3.8 or later
+- Concrete ML library installed
+
+## Additional Resources
+
+- [Client-Server Guide](../../docs/guides/client_server.md)
+- [Server Deployment Scripts](./server/README.md)
