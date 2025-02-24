@@ -11,7 +11,6 @@ DO_USER_LICENSES=1
 
 OUTPUT_DIRECTORY="${LICENSE_DIRECTORY}"
 DO_FORCE_UPDATE=0
-CP_VERSION="concrete-python[full]"
 
 while [ -n "$1" ]
 do
@@ -25,11 +24,6 @@ do
             DO_FORCE_UPDATE=1
             ;;
 
-        "--cp_version" )
-            shift
-            CP_VERSION="${1}"
-            ;;
-
         *)
             echo "Unknown param : $1"
             exit 1
@@ -37,12 +31,6 @@ do
    esac
    shift
 done
-
-# Temp file with CP version inside. We can't have a dynamic TMP_FILE_CP_VERSION filename, since it
-# changes the md5
-TMP_FILE_CP_VERSION="/tmp/cp_version.txt"
-rm -f TMP_FILE_CP_VERSION
-echo "${CP_VERSION}" > ${TMP_FILE_CP_VERSION}
 
 UNAME=$(uname)
 if [ "$UNAME" == "Darwin" ]
@@ -74,7 +62,7 @@ then
 
     # If the dependencies have not changed, don't do anything
     MD5_OLD_DEPENDENCIES=$(cat ${LICENSES_FILENAME}.md5)
-    MD5_NEW_DEPENDENCIES=$(openssl md5 poetry.lock ${TMP_FILE_CP_VERSION} | sed -e "s@(stdin)= @@g" | openssl md5 | sed -e "s@MD5@@g" | sed -e "s@(stdin)= @@g")
+    MD5_NEW_DEPENDENCIES=$(openssl md5 poetry.lock | sed -e "s@(stdin)= @@g" | openssl md5 | sed -e "s@MD5@@g" | sed -e "s@(stdin)= @@g")
 
     echo "MD5 of the poetry.lock for which dependencies have been listed: ${MD5_OLD_DEPENDENCIES}"
     echo "MD5 of the current poetry.lock:                                 ${MD5_NEW_DEPENDENCIES}"
@@ -108,6 +96,10 @@ then
         IS_CORRECT_PYTHON=1
     elif [[ "${CHECK_VERSION}" == *"3.10"* ]]; then
         IS_CORRECT_PYTHON=1
+    elif [[ "${CHECK_VERSION}" == *"3.11"* ]]; then
+        IS_CORRECT_PYTHON=1
+    elif [[ "${CHECK_VERSION}" == *"3.12"* ]]; then
+        IS_CORRECT_PYTHON=1
     fi
 
     if [ $IS_CORRECT_PYTHON -eq 0 ]
@@ -131,7 +123,6 @@ then
     fi
 
     poetry install --only main
-    python -m pip install -U --pre "${CP_VERSION}"
     python -m pip install pip-licenses
 
     # In --format=csv such that the column length (and so, the diff) do not change with longer
@@ -172,6 +163,7 @@ then
     # And check with a white-list
     # Brevitas has an "UNKNOWN" license, but is actually a BSD, so it is ignored in this test
     # pkg-resources reports UNKNOWN due to a Ubuntu bug, but is Apache - ignore
+    # concrete-ml-extensions has the same license as Concrete ML, so skip checking
     LICENSES_WHITELIST="new BSD 3-Clause"
     LICENSES_WHITELIST="${LICENSES_WHITELIST};3-Clause BSD License"
     LICENSES_WHITELIST="${LICENSES_WHITELIST};new BSD"
@@ -192,7 +184,7 @@ then
     LICENSES_WHITELIST="${LICENSES_WHITELIST};ISC License (ISCL)"
     LICENSES_WHITELIST="${LICENSES_WHITELIST};The Unlicense (Unlicense)"
 
-    pip-licenses --allow-only="${LICENSES_WHITELIST}" --ignore-packages brevitas pkg-resources pkg_resources concrete-ml-extensions-brevitas
+    pip-licenses --allow-only="${LICENSES_WHITELIST}" --ignore-packages brevitas pkg-resources pkg_resources concrete-ml-extensions
 
     deactivate
 
@@ -203,7 +195,7 @@ then
         echo "Success: no update in $LICENSES_FILENAME"
     else
         # Update the .md5 files
-        openssl md5 poetry.lock ${TMP_FILE_CP_VERSION} | sed -e "s@(stdin)= @@g" | openssl md5 | sed -e "s@MD5@@g" | sed -e "s@(stdin)= @@g" > ${LICENSES_FILENAME}.md5
+        openssl md5 poetry.lock | sed -e "s@(stdin)= @@g" | openssl md5 | sed -e "s@MD5@@g" | sed -e "s@(stdin)= @@g" > ${LICENSES_FILENAME}.md5
     fi
 fi
 

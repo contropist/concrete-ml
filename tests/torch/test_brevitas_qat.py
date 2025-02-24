@@ -495,6 +495,9 @@ def test_brevitas_constant_folding(default_configuration):
         )
 
 
+# This test is a known flaky
+# FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4356
+@pytest.mark.flaky
 @pytest.mark.parametrize("manual_rounding", [None, 3])
 @pytest.mark.parametrize("power_of_two", [True, False])
 @pytest.mark.parametrize("n_bits", [4])
@@ -505,6 +508,7 @@ def test_brevitas_power_of_two(
     power_of_two: bool,
     n_bits: int,
     is_cnn: bool,
+    check_array_equal,
 ):
     """Test a custom QAT network that uses power-of-two scaling.
 
@@ -529,15 +533,20 @@ def test_brevitas_power_of_two(
     pot_should_be_applied = not manual_rounding and power_of_two
     # Count the number of patterns that were optimized with roundPBS
     num_round_pbs_layers = 0
-    for (_, node_op) in quantized_module.quant_layers_dict.values():
+    for _, node_op in quantized_module.quant_layers_dict.values():
         if isinstance(node_op, QuantizedMixingOp):
             num_round_pbs_layers += 1 if node_op.rounding_threshold_bits is not None else 0
             if pot_should_be_applied:
-                assert node_op.rounding_threshold_bits == node_op.lsbs_to_remove
+                lsbs_to_remove = (
+                    node_op.lsbs_to_remove["matmul"]
+                    if (node_op.lsbs_to_remove is not None) and ("matmul" in node_op.lsbs_to_remove)
+                    else None
+                )
+                assert node_op.rounding_threshold_bits == lsbs_to_remove
             elif manual_rounding:
                 # If manual rounding was set, LSBs_to_remove must be equal
                 # to the accumulator size minus the requested rounding_threshold_bits
-                assert node_op.rounding_threshold_bits == manual_rounding
+                assert node_op.rounding_threshold_bits.get("n_bits", None) == manual_rounding
                 assert node_op.produces_graph_output or node_op.lsbs_to_remove is not None
 
     # The power-of-two optimization will only work
@@ -582,7 +591,7 @@ def test_brevitas_power_of_two(
     # Remove rounding in the network to perform inference without the optimization.
     # We expect a network that was optimized with the power-of-two adapter
     # to be exactly correct to the non-optimized one
-    for (_, node_op) in quantized_module.quant_layers_dict.values():
+    for _, node_op in quantized_module.quant_layers_dict.values():
         if isinstance(node_op, QuantizedMixingOp):
             node_op.rounding_threshold_bits = None
             node_op.lsbs_to_remove = None
@@ -595,5 +604,5 @@ def test_brevitas_power_of_two(
     # # Compare the result with the optimized network and without
     # # they should be equal
 
-    assert numpy.sum(y_pred_sim_round != y_pred_clear_round) == 0
-    assert numpy.sum(y_pred_clear_round != y_pred_clear_no_round) == 0
+    check_array_equal(y_pred_sim_round, y_pred_clear_round)
+    check_array_equal(y_pred_clear_round, y_pred_clear_no_round)

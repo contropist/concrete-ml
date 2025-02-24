@@ -21,6 +21,7 @@ from ..common.utils import (
     check_there_is_no_p_error_options_in_configuration,
     get_onnx_opset_version,
     manage_parameters_for_pbs_errors,
+    process_rounding_threshold_bits,
     to_tuple,
 )
 from ..onnx.convert import OPSET_VERSION_FOR_ONNX_EXPORT
@@ -72,7 +73,9 @@ def build_quantized_module(
     torch_inputset: Dataset,
     import_qat: bool = False,
     n_bits: Union[int, Dict[str, int]] = MAX_BITWIDTH_BACKWARD_COMPATIBLE,
-    rounding_threshold_bits: Optional[int] = None,
+    rounding_threshold_bits: Union[None, int, Dict[str, Union[str, int]]] = None,
+    reduce_sum_copy=False,
+    keep_onnx: Optional[bool] = True,
 ) -> QuantizedModule:
     """Build a quantized module from a Torch or ONNX model.
 
@@ -87,12 +90,20 @@ def build_quantized_module(
         import_qat (bool): Flag to signal that the network being imported contains quantizers in
             in its computation graph and that Concrete ML should not re-quantize it
         n_bits: the number of bits for the quantization
-        rounding_threshold_bits (int): if not None, every accumulators in the model are rounded down
-            to the given bits of precision
+        rounding_threshold_bits (Union[None, int, Dict[str, Union[str, int]]]): Defines precision
+            rounding for model accumulators. Accepts None, an int, or a dict.
+            The dict can specify 'method' (fhe.Exactness.EXACT or fhe.Exactness.APPROXIMATE)
+            and 'n_bits' ('auto' or int)
+        reduce_sum_copy (bool): if the inputs of QuantizedReduceSum should be copied to avoid
+            bit-width propagation
+        keep_onnx (bool): keep the onnx model inside the QuantizedModule. Set to False
+            to save memory. Keeping the onnx model is useful for debugging
 
     Returns:
         QuantizedModule: The resulting QuantizedModule.
     """
+    rounding_threshold_bits = process_rounding_threshold_bits(rounding_threshold_bits)
+
     inputset_as_numpy_tuple = tuple(
         convert_torch_tensor_or_numpy_array_to_numpy_array(val) for val in to_tuple(torch_inputset)
     )
@@ -101,8 +112,15 @@ def build_quantized_module(
     # this batch size. The input set contains many examples, to determine a representative
     # bit-width, but for tracing we only take a single one. We need the ONNX tracing batch size to
     # match the batch size during FHE inference which can only be 1 for the moment.
+    # We need to convert float64 to float32 to avoid errors later in the onnx export.
+    # When we have integer inputs, we can keep them as integers.
     dummy_input_for_tracing = tuple(
-        torch.from_numpy(val[[0], ::]).float() for val in inputset_as_numpy_tuple
+        (
+            torch.from_numpy(val[[0], ::]).float()
+            if val.dtype == numpy.float64
+            else torch.from_numpy(val[[0], ::])
+        )
+        for val in inputset_as_numpy_tuple
     )
 
     # Create corresponding numpy model
@@ -116,7 +134,14 @@ def build_quantized_module(
     # FIXME: mismatch here. We traced with dummy_input_for_tracing which made some operator
     # only work over shape of (1, ., .). For example, some reshape have newshape hardcoded based
     # on the inputset we sent in the NumpyModule.
-    quantized_module = post_training_quant.quantize_module(*inputset_as_numpy_tuple)
+
+    quantized_module = post_training_quant.quantize_module(
+        *inputset_as_numpy_tuple, keep_onnx=keep_onnx
+    )
+
+    # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4127
+    if reduce_sum_copy:
+        quantized_module.set_reduce_sum_copy()
 
     return quantized_module
 
@@ -130,11 +155,14 @@ def _compile_torch_or_onnx_model(
     artifacts: Optional[DebugArtifacts] = None,
     show_mlir: bool = False,
     n_bits: Union[int, Dict[str, int]] = MAX_BITWIDTH_BACKWARD_COMPATIBLE,
-    rounding_threshold_bits: Optional[int] = None,
+    rounding_threshold_bits: Union[None, int, Dict[str, Union[str, int]]] = None,
     p_error: Optional[float] = None,
     global_p_error: Optional[float] = None,
     verbose: bool = False,
     inputs_encryption_status: Optional[Sequence[str]] = None,
+    reduce_sum_copy: bool = False,
+    composition_mapping: Optional[Dict] = None,
+    device: str = "cpu",
 ) -> QuantizedModule:
     """Compile a torch module or ONNX into an FHE equivalent.
 
@@ -152,23 +180,50 @@ def _compile_torch_or_onnx_model(
         artifacts (DebugArtifacts): Artifacts object to fill during compilation
         show_mlir (bool): if set, the MLIR produced by the converter and which is going
             to be sent to the compiler backend is shown on the screen, e.g., for debugging or demo
-        n_bits: the number of bits for the quantization
-        rounding_threshold_bits (int): if not None, every accumulators in the model are rounded down
-            to the given bits of precision
+        n_bits (Union[int, Dict[str, int]]): number of bits for quantization, can be a single value
+            or a dictionary with the following keys :
+            - "op_inputs" and "op_weights" (mandatory)
+            - "model_inputs" and "model_outputs" (optional, default to 5 bits).
+            When using a single integer for n_bits, its value is assigned to "op_inputs" and
+            "op_weights" bits. Default is 8 bits.
+        rounding_threshold_bits (Union[None, int, Dict[str, Union[str, int]]]): Defines precision
+            rounding for model accumulators. Accepts None, an int, or a dict.
+            The dict can specify 'method' (fhe.Exactness.EXACT or fhe.Exactness.APPROXIMATE)
+            and 'n_bits' ('auto' or int)
         p_error (Optional[float]): probability of error of a single PBS
         global_p_error (Optional[float]): probability of error of the full circuit. In FHE
             simulation `global_p_error` is set to 0
         verbose (bool): whether to show compilation information
         inputs_encryption_status (Optional[Sequence[str]]): encryption status ('clear', 'encrypted')
             for each input. By default all arguments will be encrypted.
+        reduce_sum_copy (bool): if the inputs of QuantizedReduceSum should be copied to avoid
+            bit-width propagation
+        composition_mapping (Optional[Dict]): Dictionary that maps output positions with input
+            positions in the case of composable circuits. Setting this parameter triggers a
+            re-quantization step at the end of the FHE circuit. This makes sure outputs are
+            de-quantized using their output quantizer and then re-quantized using their associated
+            input quantizer. Default to None.
+        device: FHE compilation device, can be either 'cpu' or 'cuda'.
 
     Returns:
         QuantizedModule: The resulting compiled QuantizedModule.
+
+    Raises:
+        ValueError: If a input-output mapping ('composition_mapping') is set but composition is not
+            enabled at the Concrete level (in 'configuration').
     """
+    rounding_threshold_bits = process_rounding_threshold_bits(rounding_threshold_bits)
 
     inputset_as_numpy_tuple = tuple(
         convert_torch_tensor_or_numpy_array_to_numpy_array(val) for val in to_tuple(torch_inputset)
     )
+
+    # Check that composition is enabled if an input-output mapping has been set
+    if composition_mapping is not None and (configuration is None or not configuration.composable):
+        raise ValueError(
+            "Composition must be enabled in 'configuration' in order to trigger a re-quantization "
+            "step on the circuit's outputs."
+        )
 
     # Build the quantized module
     quantized_module = build_quantized_module(
@@ -177,6 +232,7 @@ def _compile_torch_or_onnx_model(
         import_qat=import_qat,
         n_bits=n_bits,
         rounding_threshold_bits=rounding_threshold_bits,
+        reduce_sum_copy=reduce_sum_copy,
     )
 
     # Check that p_error or global_p_error is not set in both the configuration and in the direct
@@ -197,6 +253,13 @@ def _compile_torch_or_onnx_model(
     # Find the right way to set parameters for compiler, depending on the way we want to default
     p_error, global_p_error = manage_parameters_for_pbs_errors(p_error, global_p_error)
 
+    # If a mapping between input and output quantizers is set, add a re-quantization step at the
+    # end of the forward call. This is only useful for composable circuits in order to make sure
+    # that input and output quantizers match
+    if composition_mapping is not None:
+        # pylint: disable-next=protected-access
+        quantized_module._add_requant_for_composition(composition_mapping)
+
     quantized_module.compile(
         inputset_as_numpy_tuple,
         configuration,
@@ -206,6 +269,7 @@ def _compile_torch_or_onnx_model(
         global_p_error=global_p_error,
         verbose=verbose,
         inputs_encryption_status=inputs_encryption_status,
+        device=device,
     )
 
     return quantized_module
@@ -220,11 +284,13 @@ def compile_torch_model(
     artifacts: Optional[DebugArtifacts] = None,
     show_mlir: bool = False,
     n_bits: Union[int, Dict[str, int]] = MAX_BITWIDTH_BACKWARD_COMPATIBLE,
-    rounding_threshold_bits: Optional[int] = None,
+    rounding_threshold_bits: Union[None, int, Dict[str, Union[str, int]]] = None,
     p_error: Optional[float] = None,
     global_p_error: Optional[float] = None,
     verbose: bool = False,
     inputs_encryption_status: Optional[Sequence[str]] = None,
+    reduce_sum_copy: bool = False,
+    device: str = "cpu",
 ) -> QuantizedModule:
     """Compile a torch module into an FHE equivalent.
 
@@ -243,15 +309,25 @@ def compile_torch_model(
             during compilation
         show_mlir (bool): if set, the MLIR produced by the converter and which is going
             to be sent to the compiler backend is shown on the screen, e.g., for debugging or demo
-        n_bits: the number of bits for the quantization
-        rounding_threshold_bits (int): if not None, every accumulators in the model are rounded down
-            to the given bits of precision
+        n_bits (Union[int, Dict[str, int]]): number of bits for quantization, can be a single value
+            or a dictionary with the following keys :
+            - "op_inputs" and "op_weights" (mandatory)
+            - "model_inputs" and "model_outputs" (optional, default to 5 bits).
+            When using a single integer for n_bits, its value is assigned to "op_inputs" and
+            "op_weights" bits. Default is 8 bits.
+        rounding_threshold_bits (Union[None, int, Dict[str, Union[str, int]]]): Defines precision
+            rounding for model accumulators. Accepts None, an int, or a dict.
+            The dict can specify 'method' (fhe.Exactness.EXACT or fhe.Exactness.APPROXIMATE)
+            and 'n_bits' ('auto' or int)
         p_error (Optional[float]): probability of error of a single PBS
         global_p_error (Optional[float]): probability of error of the full circuit. In FHE
             simulation `global_p_error` is set to 0
         verbose (bool): whether to show compilation information
         inputs_encryption_status (Optional[Sequence[str]]): encryption status ('clear', 'encrypted')
             for each input. By default all arguments will be encrypted.
+        reduce_sum_copy (bool): if the inputs of QuantizedReduceSum should be copied to avoid
+            bit-width propagation
+        device: FHE compilation device, can be either 'cpu' or 'cuda'.
 
     Returns:
         QuantizedModule: The resulting compiled QuantizedModule.
@@ -281,6 +357,8 @@ def compile_torch_model(
         global_p_error=global_p_error,
         verbose=verbose,
         inputs_encryption_status=inputs_encryption_status,
+        reduce_sum_copy=reduce_sum_copy,
+        device=device,
     )
 
 
@@ -293,11 +371,13 @@ def compile_onnx_model(
     artifacts: Optional[DebugArtifacts] = None,
     show_mlir: bool = False,
     n_bits: Union[int, Dict[str, int]] = MAX_BITWIDTH_BACKWARD_COMPATIBLE,
-    rounding_threshold_bits: Optional[int] = None,
+    rounding_threshold_bits: Union[None, int, Dict[str, Union[str, int]]] = None,
     p_error: Optional[float] = None,
     global_p_error: Optional[float] = None,
     verbose: bool = False,
     inputs_encryption_status: Optional[Sequence[str]] = None,
+    reduce_sum_copy: bool = False,
+    device: str = "cpu",
 ) -> QuantizedModule:
     """Compile a torch module into an FHE equivalent.
 
@@ -316,15 +396,25 @@ def compile_onnx_model(
             during compilation
         show_mlir (bool): if set, the MLIR produced by the converter and which is going
             to be sent to the compiler backend is shown on the screen, e.g., for debugging or demo
-        n_bits: the number of bits for the quantization
-        rounding_threshold_bits (int): if not None, every accumulators in the model are rounded down
-            to the given bits of precision
+        n_bits (Union[int, Dict[str, int]]): number of bits for quantization, can be a single value
+            or a dictionary with the following keys :
+            - "op_inputs" and "op_weights" (mandatory)
+            - "model_inputs" and "model_outputs" (optional, default to 5 bits).
+            When using a single integer for n_bits, its value is assigned to "op_inputs" and
+            "op_weights" bits. Default is 8 bits.
+        rounding_threshold_bits (Union[None, int, Dict[str, Union[str, int]]]): Defines precision
+            rounding for model accumulators. Accepts None, an int, or a dict.
+            The dict can specify 'method' (fhe.Exactness.EXACT or fhe.Exactness.APPROXIMATE)
+            and 'n_bits' ('auto' or int)
         p_error (Optional[float]): probability of error of a single PBS
         global_p_error (Optional[float]): probability of error of the full circuit. In FHE
             simulation `global_p_error` is set to 0
         verbose (bool): whether to show compilation information
         inputs_encryption_status (Optional[Sequence[str]]): encryption status ('clear', 'encrypted')
             for each input. By default all arguments will be encrypted.
+        reduce_sum_copy (bool): if the inputs of QuantizedReduceSum should be copied to avoid
+            bit-width propagation
+        device: FHE compilation device, can be either 'cpu' or 'cuda'.
 
     Returns:
         QuantizedModule: The resulting compiled QuantizedModule.
@@ -350,6 +440,8 @@ def compile_onnx_model(
         global_p_error=global_p_error,
         verbose=verbose,
         inputs_encryption_status=inputs_encryption_status,
+        reduce_sum_copy=reduce_sum_copy,
+        device=device,
     )
 
 
@@ -361,12 +453,14 @@ def compile_brevitas_qat_model(
     configuration: Optional[Configuration] = None,
     artifacts: Optional[DebugArtifacts] = None,
     show_mlir: bool = False,
-    rounding_threshold_bits: Optional[int] = None,
+    rounding_threshold_bits: Union[None, int, Dict[str, Union[str, int]]] = None,
     p_error: Optional[float] = None,
     global_p_error: Optional[float] = None,
     output_onnx_file: Union[None, Path, str] = None,
     verbose: bool = False,
     inputs_encryption_status: Optional[Sequence[str]] = None,
+    reduce_sum_copy: bool = False,
+    device: str = "cpu",
 ) -> QuantizedModule:
     """Compile a Brevitas Quantization Aware Training model.
 
@@ -391,8 +485,10 @@ def compile_brevitas_qat_model(
             during compilation
         show_mlir (bool): if set, the MLIR produced by the converter and which is going
             to be sent to the compiler backend is shown on the screen, e.g., for debugging or demo
-        rounding_threshold_bits (int): if not None, every accumulators in the model are rounded down
-            to the given bits of precision
+        rounding_threshold_bits (Union[None, int, Dict[str, Union[str, int]]]): Defines precision
+            rounding for model accumulators. Accepts None, an int, or a dict.
+            The dict can specify 'method' (fhe.Exactness.EXACT or fhe.Exactness.APPROXIMATE)
+            and 'n_bits' ('auto' or int)
         p_error (Optional[float]): probability of error of a single PBS
         global_p_error (Optional[float]): probability of error of the full circuit. In FHE
             simulation `global_p_error` is set to 0
@@ -401,6 +497,9 @@ def compile_brevitas_qat_model(
         verbose (bool): whether to show compilation information
         inputs_encryption_status (Optional[Sequence[str]]): encryption status ('clear', 'encrypted')
             for each input. By default all arguments will be encrypted.
+        reduce_sum_copy (bool): if the inputs of QuantizedReduceSum should be copied to avoid
+            bit-width propagation
+        device: FHE compilation device, can be either 'cpu' or 'cuda'.
 
     Returns:
         QuantizedModule: The resulting compiled QuantizedModule.
@@ -495,6 +594,8 @@ def compile_brevitas_qat_model(
         global_p_error=global_p_error,
         verbose=verbose,
         inputs_encryption_status=inputs_encryption_status,
+        reduce_sum_copy=reduce_sum_copy,
+        device=device,
     )
 
     # Remove the tempfile if we used one

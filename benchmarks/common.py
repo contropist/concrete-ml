@@ -74,6 +74,7 @@ REGRESSORS_NAMES = [
     "NeuralNetRegressor",
     "RandomForestRegressor",
     "XGBRegressor",
+    "SGDRegressor",
 ]
 for model_name in REGRESSORS_NAMES:
     try:
@@ -236,7 +237,6 @@ DATASET_VERSIONS = {
 
 
 # This is only for benchmarks to speed up compilation times
-# Jit compiler is now deprecated and will soon be removed, it is thus forced to False by default
 # Parameter `enable_unsafe_features` and `use_insecure_key_cache` are needed in order to be able to
 # cache generated keys through `insecure_key_cache_location`. As the name suggests, these
 # parameters are unsafe and should only be used for debugging in development
@@ -244,8 +244,7 @@ BENCHMARK_CONFIGURATION = fhe.Configuration(
     dump_artifacts_on_unexpected_failures=True,
     enable_unsafe_features=True,
     use_insecure_key_cache=True,
-    insecure_key_cache_location="ConcreteNumpyKeyCache",
-    jit=False,
+    insecure_key_cache_location="ConcretePythonKeyCache",
 )
 
 
@@ -274,7 +273,7 @@ def run_and_report_classification_metrics(
             (f1_score, "f1", "F1Score"),
         ]
 
-    for (metric, metric_id, metric_label) in metric_info:
+    for metric, metric_id, metric_label in metric_info:
         run_and_report_metric(
             y_gt,
             y_pred,
@@ -288,7 +287,7 @@ def run_and_report_regression_metrics(y_gt, y_pred, metric_id_prefix, metric_lab
     """Run several metrics and report results to progress tracker with computed name and id"""
 
     metric_info = [(r2_score, "r2_score", "R2Score"), (mean_squared_error, "MSE", "MSE")]
-    for (metric, metric_id, metric_label) in metric_info:
+    for metric, metric_id, metric_label in metric_info:
         run_and_report_metric(
             y_gt,
             y_pred,
@@ -317,7 +316,7 @@ def should_test_config_in_fhe(
     if local_args.execute_in_fhe != "auto":
         return local_args.execute_in_fhe
 
-    model_name = model.__name__
+    model_name = model.__name__  # pylint: disable=redefined-outer-name
     assert config is not None
 
     # System override to disable FHE benchmarks (useful for debugging)
@@ -341,6 +340,7 @@ def should_test_config_in_fhe(
         "TweedieRegressor",
         "PoissonRegressor",
         "GammaRegressor",
+        "SGDRegressor",
     }:
         return True
 
@@ -702,7 +702,7 @@ def benchmark_name_generator(
     """Turns a combination of data-set + model + hyper-parameters and returns a string"""
     assert isinstance(model, type), f"Wrong type: {type(model)} - {model}"
 
-    model_name = model.__name__
+    model_name = model.__name__  # pylint: disable=redefined-outer-name
 
     assert (
         model_name in MODEL_NAMES
@@ -757,6 +757,8 @@ def benchmark_name_generator(
 
     elif model_name in DEEP_LEARNING_NAMES:
         config_str = f"_{config['n_bits']}"
+    else:
+        config_str = "UNKNOWN"
 
     # We remove underscores to make sure to not have any conflict when splitting
     return model_name.replace("_", "-") + config_str + joiner + dataset_name.replace("_", "-")
@@ -767,13 +769,14 @@ def benchmark_name_generator(
 # - The functions support all models
 # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/1866
 
+
 # pylint: disable-next=too-many-branches, redefined-outer-name
 def benchmark_name_to_config(
     benchmark_name: str, joiner: str = "_"
 ) -> Tuple[str, str, Dict[str, Any]]:
     """Convert a benchmark name to each part"""
     splitted = benchmark_name.split(joiner)
-    model_name = splitted[0]
+    model_name = splitted[0]  # pylint: disable=redefined-outer-name
     dataset_name = splitted[-1]
     config_str = splitted[1:-1]
     config_dict = {}

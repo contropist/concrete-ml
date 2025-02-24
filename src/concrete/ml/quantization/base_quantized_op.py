@@ -18,9 +18,19 @@ from .quantizers import (
     QuantizationOptions,
     QuantizedArray,
     UniformQuantizationParameters,
+    UniformQuantizer,
 )
 
-ONNXOpInputOutputType = Union[numpy.ndarray, QuantizedArray, None]
+# pylint: disable=too-many-lines
+
+ONNXOpInputOutputType = Union[
+    numpy.ndarray,
+    QuantizedArray,
+    None,
+    bool,
+    int,
+    float,
+]
 
 ALL_QUANTIZED_OPS: Set[Type] = set()
 
@@ -228,14 +238,14 @@ class QuantizedOp:
         metadata["_input_idx_to_params_name"] = self._input_idx_to_params_name
         metadata["_params_that_are_onnx_inputs"] = self._params_that_are_onnx_inputs
         metadata["_params_that_are_onnx_var_inputs"] = self._params_that_are_onnx_var_inputs
-        metadata[
-            "_params_that_are_required_onnx_inputs"
-        ] = self._params_that_are_required_onnx_inputs
+        metadata["_params_that_are_required_onnx_inputs"] = (
+            self._params_that_are_required_onnx_inputs
+        )
         metadata["_has_attr"] = self._has_attr
         metadata["_inputs_not_quantized"] = self._inputs_not_quantized
-        metadata[
-            "quantize_inputs_with_model_outputs_precision"
-        ] = self.quantize_inputs_with_model_outputs_precision
+        metadata["quantize_inputs_with_model_outputs_precision"] = (
+            self.quantize_inputs_with_model_outputs_precision
+        )
         metadata["produces_graph_output"] = self.produces_graph_output
         metadata["produces_raw_output"] = self.produces_raw_output
         metadata["error_tracker"] = self.error_tracker
@@ -247,6 +257,9 @@ class QuantizedOp:
 
             if attribute_name not in metadata:
                 metadata[attribute_name] = attribute_value
+
+        # Sort the metadata to be sure it is always saved in the same order
+        metadata = dict(sorted(metadata.items()))
 
         return metadata
 
@@ -547,7 +560,10 @@ class QuantizedOp:
         # but when parsing the ONNX graph, some options can be overwritten. Thus
         # when evaluating QAT layers we ignore one of these options to allow the
         # override.
-        if quant_opts.is_equal(input_.quantizer.quant_options, ignore_sign_qat=True):
+        if (
+            quant_opts.is_equal(input_.quantizer.quant_options, ignore_sign_qat=True)
+            or input_.quantizer.quant_options.is_precomputed_qat
+        ):
             # Pass-through the input quantizer when the input is already quantized in
             # the manner that this op requires: this makes the op use the qvalues directly,
             # in q_impl and will avoid a TLU to re-quantize.
@@ -649,7 +665,9 @@ class QuantizedOp:
             elif calibrate or is_clear_value:
                 # This is used during calibration with numpy.ndarrays
                 # or then the input is raw (not quantized)
-                prepared_inputs[curr_input_fill_idx] = input_
+                prepared_inputs[curr_input_fill_idx] = (
+                    input_.values if isinstance(input_, QuantizedArray) else input_
+                )
             elif quantize_actual_values:
                 # This is used by mixing (conv/gemm) or value re-arranging ops (reshape)
                 input_ = cast(QuantizedArray, input_)
@@ -662,9 +680,6 @@ class QuantizedOp:
                     new_input.quantizer.is_qat
                     and not input_.quantizer.is_precomputed_qat
                     and self.error_tracker is not None
-                    and not new_input.quantizer.check_is_uniform_quantized(
-                        new_input.quantizer.quant_options
-                    )
                 ):
                     self.error_tracker.append(input_idx)
 
@@ -688,7 +703,7 @@ class QuantizedOp:
 
         return prepared_inputs
 
-    def calibrate(self, *inputs: numpy.ndarray) -> numpy.ndarray:
+    def calibrate(self, *inputs: Union[QuantizedArray, numpy.ndarray]) -> numpy.ndarray:
         """Create corresponding QuantizedArray for the output of the activation function.
 
         Args:
@@ -700,6 +715,8 @@ class QuantizedOp:
 
         # Here we need the actual values of the constants, we need to pass through
         # the numpy.ndarrays in the computation graph
+        # Mixing ops may be calibrated using QuantizedArray inputs, in order
+        # to pre-compute anlytical output quantization
         prepared_inputs = self._prepare_inputs_with_constants(
             *inputs, calibrate=True, quantize_actual_values=False
         )
@@ -708,12 +725,48 @@ class QuantizedOp:
         if isinstance(raw_result, RawOpOutput):
             return raw_result
 
-        quantized_samples = QuantizedArray(self.n_bits, raw_result)
+        # If the caller passes only QuantizedArray it means
+        # that they are asking to quantized using analytical
+        # formulas
+        requested_analytical_quant = all(
+            isinstance(qv, QuantizedArray) for qv in inputs
+        ) and isinstance(self, QuantizedMixingOp)
+        if requested_analytical_quant:
+            assert_true(
+                self.supported_by_linear_backend(),
+                "Calibration using QuantizedArray is only possible"
+                " for operations that can calibrate analytically",
+            )
+            q_prepared_inputs = self._prepare_inputs_with_constants(
+                *inputs, calibrate=False, quantize_actual_values=True
+            )
+            quantizer = self.calibrate_analytical_output(*q_prepared_inputs)
+            self.output_quant_params = quantizer.quant_params
+            self.output_quant_stats = quantizer.quant_stats
+        else:
+            # These output quantization parameters are only used
+            # for operations that produce graph output operation
+            # and are a non-linear
+            quantized_samples = QuantizedArray(self.n_bits, raw_result)
 
-        self.output_quant_params = quantized_samples.quantizer.quant_params
-        self.output_quant_stats = quantized_samples.quantizer.quant_stats
+            self.output_quant_params = quantized_samples.quantizer.quant_params
+            self.output_quant_stats = quantized_samples.quantizer.quant_stats
 
-        return quantized_samples.values
+        return raw_result
+
+    def calibrate_analytical_output(self, *inputs: QuantizedArray) -> UniformQuantizer:
+        """Calibrate output quantization based on analytical formulas.
+
+        Args:
+            *inputs (QuantizedArray): quantized operation inputs. Quantized weights
+                are storea in the op instance
+
+        Raises:
+            AssertionError: if the operation does not support analytical calibration
+        """
+        raise AssertionError(
+            f"calibrate_analytical_output: not implemented for {self._impl_for_op_named} op"
+        )
 
     def prepare_output(self, qoutput_activation: numpy.ndarray) -> QuantizedArray:
         """Quantize the output of the activation function.
@@ -776,7 +829,7 @@ class QuantizedOp:
 
         return outputs[0]
 
-    def can_fuse(self) -> bool:  # pylint: disable=no-self-use
+    def can_fuse(self) -> bool:
         """Determine if the operator impedes graph fusion.
 
         This function shall be overloaded by inheriting classes to test self._int_input_names, to
@@ -804,6 +857,15 @@ class QuantizedOp:
         if self.can_fuse():
             output_quant_opts.is_qat = False
         return output_quant_opts
+
+    @classmethod
+    def supported_by_linear_backend(cls) -> bool:
+        """Indicate if this op can be executed on the GLWE linear backend.
+
+        Returns:
+            bool: True if the op can be executed with GLWE.
+        """
+        return False
 
 
 class QuantizedOpUnivariateOfEncrypted(QuantizedOp, is_utility=True):
@@ -865,14 +927,23 @@ class QuantizedMixingOp(QuantizedOp, is_utility=True):
     Mixing operators cannot be fused to TLUs.
     """
 
-    lsbs_to_remove: Optional[int] = None
-    rounding_threshold_bits: Optional[int] = None
+    lsbs_to_remove: Optional[Union[int, dict]] = None
+    rounding_threshold_bits: Union[None, int, Dict[str, Union[str, int]]] = None
 
-    def __init__(self, *args, rounding_threshold_bits: Optional[int] = None, **kwargs) -> None:
+    def __init__(
+        self,
+        *args,
+        rounding_threshold_bits: Union[None, int, Dict[str, Union[str, int]]] = None,
+        **kwargs,
+    ) -> None:
         """Initialize quantized ops parameters plus specific parameters.
 
         Args:
-            rounding_threshold_bits (Optional[int]): Number of bits to round to.
+            rounding_threshold_bits (Union[None, int, Dict[str, Union[str, int]]]): if not None,
+                every accumulators in the model are rounded down to the given bits of precision.
+                Can be an int or a dictionary with keys 'method' and 'n_bits', where 'method' is
+                either fhe.Exactness.EXACT or fhe.Exactness.APPROXIMATE, and 'n_bits' is either
+                'auto' or an int.
             *args: positional argument to pass to the parent class.
             **kwargs: named argument to pass to the parent class.
         """
@@ -910,11 +981,6 @@ class QuantizedMixingOp(QuantizedOp, is_utility=True):
         Returns:
             QuantizedArray: the quantized array that will be passed to the QuantizedModule output.
         """
-
-        out_opts = self._get_output_quant_opts()
-        out_opts.is_signed = False
-        out_opts.is_symmetric = False
-
         # Since we don't know the real bit-width of these quantized values,
         # return a quantizer that has zero offset
         out_params = UniformQuantizationParameters(
@@ -933,39 +999,68 @@ class QuantizedMixingOp(QuantizedOp, is_utility=True):
         )
 
     def cnp_round(
-        self, x: Union[numpy.ndarray, fhe.tracing.Tracer], calibrate_rounding: bool
+        self,
+        x: Union[numpy.ndarray, fhe.tracing.Tracer],
+        calibrate_rounding: bool,
+        rounding_operation_id: Optional[str] = "single_rounding_op",
     ) -> numpy.ndarray:
         """Round the input array to the specified number of bits.
 
         Args:
             x (Union[numpy.ndarray, fhe.tracing.Tracer]): The input array to be rounded.
             calibrate_rounding (bool): Whether to calibrate the rounding
-                (compute the lsbs_to_remove)
+                (compute the lsbs_to_remove).
+            rounding_operation_id (Optional[str]): The identifier for a specific rounding
+                operation in a quantized operation. Used to create and access the
+                lsbs_to_remove value in the dictionary. Defaults to "single_rounding_op"
+                if not provided.
 
         Returns:
             numpy.ndarray: The rounded array.
         """
+        # Ensure lsbs_to_remove is initialized as a dictionary
+        if not hasattr(self, "lsbs_to_remove") or not isinstance(self.lsbs_to_remove, dict):
+            self.lsbs_to_remove = {}
 
-        # Rounding is applied only if specified by user
-        if self.rounding_threshold_bits is not None:
-            if calibrate_rounding:
-                assert_true(
-                    not isinstance(x, fhe.tracing.Tracer),
-                    "Can't compute lsbs_to_remove at compilation time.",
-                )
-                assert_true(
-                    self.lsbs_to_remove is None,
-                    "Rounding has already been calibrated.",
-                )
+        n_bits = None
+        exactness = fhe.Exactness.EXACT
 
-                current_n_bits_accumulator = compute_bits_precision(x)
-                self.lsbs_to_remove = current_n_bits_accumulator - self.rounding_threshold_bits
+        if isinstance(self.rounding_threshold_bits, dict):
+            n_bits = self.rounding_threshold_bits.get("n_bits", None)
+            exactness = self.rounding_threshold_bits.get("method", exactness)
+        # PoT is replacing inplace the rounding_threshold_bits to an int
+        elif isinstance(self.rounding_threshold_bits, int):
+            n_bits = self.rounding_threshold_bits
+
+        if n_bits is not None and calibrate_rounding:
+            # Compute lsbs_to_remove only when calibration is True
+            current_n_bits_accumulator = compute_bits_precision(x)
 
             # mypy
-            assert self.lsbs_to_remove is not None
+            assert isinstance(n_bits, int)
+            computed_lsbs_to_remove = current_n_bits_accumulator - n_bits
 
-            # Apply rounding if needed
-            if self.lsbs_to_remove > 0:
-                x = fhe.round_bit_pattern(x, lsbs_to_remove=self.lsbs_to_remove)
+            assert_true(
+                not isinstance(x, fhe.tracing.Tracer),
+                "Can't compute lsbs_to_remove at compilation time.",
+            )
 
+            # Update the lsbs_to_remove value in the dictionary
+            self.lsbs_to_remove[rounding_operation_id] = max(
+                self.lsbs_to_remove.get(rounding_operation_id, 0),
+                computed_lsbs_to_remove,
+            )
+
+        # Rounding logic
+        lsbs_value = self.lsbs_to_remove.get(rounding_operation_id, 0)
+
+        # mypy
+        assert isinstance(lsbs_value, int)
+
+        if lsbs_value > 0:
+            # Rounding to low bit-width with approximate can cause issues with overflow protection
+            # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4345
+            x = fhe.round_bit_pattern(
+                x, lsbs_to_remove=lsbs_value, exactness=exactness, overflow_protection=False
+            )
         return x

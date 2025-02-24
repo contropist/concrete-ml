@@ -1,4 +1,5 @@
 """Import sklearn models."""
+
 from typing import Dict, List, Optional, Union
 
 from ..common.debugging.custom_assert import assert_true
@@ -15,7 +16,15 @@ from .base import (
     _TREE_MODELS,
 )
 from .glm import GammaRegressor, PoissonRegressor, TweedieRegressor
-from .linear_model import ElasticNet, Lasso, LinearRegression, LogisticRegression, Ridge
+from .linear_model import (
+    ElasticNet,
+    Lasso,
+    LinearRegression,
+    LogisticRegression,
+    Ridge,
+    SGDClassifier,
+    SGDRegressor,
+)
 from .neighbors import KNeighborsClassifier
 from .qnn import NeuralNetClassifier, NeuralNetRegressor
 from .rf import RandomForestClassifier, RandomForestRegressor

@@ -4,7 +4,6 @@ import sys
 import warnings
 from collections import OrderedDict
 from pathlib import Path
-from time import time
 from typing import Callable, Dict, Optional, Tuple
 
 import matplotlib.pyplot as plt
@@ -14,7 +13,6 @@ import torch.nn as nn
 from brevitas import config
 from concrete.fhe.compilation import Configuration
 from models import Fp32VGG11
-from sklearn.metrics import top_k_accuracy_score
 from torch.utils.data.dataloader import DataLoader
 from torchvision import datasets, transforms
 from torchvision.utils import make_grid
@@ -255,7 +253,7 @@ def plot_baseline(param: Dict, data: DataLoader, device: str) -> None:
     checkpoint = torch.load(f"{param['dir']}/{param['pre_trained_path']}", map_location=device)
     fp32_vgg = Fp32VGG11(param["output_size"])
     fp32_vgg.load_state_dict(checkpoint)
-    baseline = torch_inference(fp32_vgg, data, param, device)
+    baseline = torch_inference(fp32_vgg, data, device)
 
     plt.plot(
         range(len(param["accuracy_test"])),
@@ -416,7 +414,6 @@ def torch_inference(
     device: str = "cpu",
     verbose: bool = False,
 ) -> float:
-
     """Returns the `top_k` accuracy.
 
     Args:
@@ -442,12 +439,13 @@ def torch_inference(
     return np.mean(np.vstack(correct), dtype="float64")
 
 
-def fhe_compatibility(model: Callable, data: DataLoader) -> Callable:
+def fhe_compatibility(model: Callable, data: DataLoader, device: str) -> Callable:
     """Test if the model is FHE-compatible.
 
     Args:
         model (Callable): The Brevitas model.
         data (DataLoader): The data loader.
+        device (str): Specifies the device to run during the compilation, either 'cpu' or 'gpu'.
 
     Returns:
         Callable: Quantized model.
@@ -459,13 +457,13 @@ def fhe_compatibility(model: Callable, data: DataLoader) -> Callable:
         torch_inputset=data,
         show_mlir=False,
         output_onnx_file="test.onnx",
+        device=device,
     )
 
     return qmodel
 
 
 def mapping_keys(pre_trained_weights: Dict, model: nn.Module, device: str) -> nn.Module:
-
     """
     Initialize the quantized model with pre-trained fp32 weights.
 

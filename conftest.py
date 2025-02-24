@@ -1,5 +1,8 @@
 """PyTest configuration file."""
+
+import hashlib
 import json
+import os
 import random
 import re
 from pathlib import Path
@@ -12,6 +15,7 @@ from concrete.fhe import Graph as CPGraph
 from concrete.fhe.compilation import Circuit, Configuration
 from concrete.fhe.mlir.utils import MAXIMUM_TLU_BIT_WIDTH
 from sklearn.datasets import make_classification, make_regression
+from sklearn.metrics import accuracy_score
 
 from concrete.ml.common.utils import (
     SUPPORTED_FLOAT_TYPES,
@@ -50,18 +54,15 @@ def pytest_addoption(parser):
     )
 
     parser.addoption(
-        "--forcing_random_seed",
-        action="store",
-        default=None,
-        type=int,
-        help="To force the seed of each and every unit test, to be able to "
-        "reproduce a particular issue.",
-    )
-
-    parser.addoption(
         "--weekly",
         action="store_true",
         help="To do longer tests.",
+    )
+
+    parser.addoption(
+        "--use_gpu",
+        action="store_true",
+        help="Force GPU compilation and execution in tests.",
     )
 
     parser.addoption(
@@ -102,7 +103,7 @@ def monkeypatched_compilation_configuration_init_for_codeblocks(
     self.enable_unsafe_features = True
     self.treat_warnings_as_errors = True
     self.use_insecure_key_cache = True
-    self.insecure_key_cache_location = "ConcreteNumpyKeyCache"
+    self.insecure_key_cache_location = "ConcretePythonKeyCache"
 
 
 def pytest_sessionstart(session: pytest.Session):
@@ -145,7 +146,27 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus):  # pylint: disabl
 
 @pytest.fixture
 def default_configuration():
-    """Return the default test compilation configuration."""
+    """Return the compilation configuration for tests that can execute in FHE."""
+
+    # Parameter `enable_unsafe_features` and `use_insecure_key_cache` are needed in order to be
+    # able to cache generated keys through `insecure_key_cache_location`. As the name suggests,
+    # these parameters are unsafe and should only be used for debugging in development
+    # Simulation compilation is done lazily when calling circuit.simulate, so we do not need to
+    # set it by default
+    return Configuration(
+        dump_artifacts_on_unexpected_failures=False,
+        enable_unsafe_features=True,
+        use_insecure_key_cache=True,
+        insecure_key_cache_location="ConcretePythonKeyCache",
+        fhe_simulation=False,
+        fhe_execution=True,
+        compress_input_ciphertexts=os.environ.get("USE_INPUT_COMPRESSION", "1") == "1",
+    )
+
+
+@pytest.fixture
+def simulation_configuration():
+    """Return the compilation configuration for tests that only simulate."""
 
     # Parameter `enable_unsafe_features` and `use_insecure_key_cache` are needed in order to be
     # able to cache generated keys through `insecure_key_cache_location`. As the name suggests,
@@ -154,7 +175,10 @@ def default_configuration():
         dump_artifacts_on_unexpected_failures=False,
         enable_unsafe_features=True,
         use_insecure_key_cache=True,
-        insecure_key_cache_location="ConcreteNumpyKeyCache",
+        insecure_key_cache_location="ConcretePythonKeyCache",
+        fhe_simulation=True,
+        fhe_execution=False,
+        compress_input_ciphertexts=os.environ.get("USE_INPUT_COMPRESSION", "1") == "1",
     )
 
 
@@ -176,28 +200,68 @@ def function_to_seed_torch(seed):
 
 
 @pytest.fixture(autouse=True)
-def autoseeding_of_everything(record_property, request):
+def autoseeding_of_everything(request):
     """Seed everything we can, for determinism."""
-    main_seed = request.config.getoption("--forcing_random_seed", default=None)
 
-    if main_seed is None:
-        main_seed = random.randint(0, 2**64 - 1)
+    # Explanations on the seeding system:
+    #
+    # The used seed (called sub_seed below) for a test of a function f_i (e.g.,
+    # test_compute_bits_precision) on a configuration c_j (e.g., x0-8) of a test file t_k (e.g.,
+    # tests/common/test_utils.py) is computed as some hash(f_i, c_j, t_k, randomly-seed)
+    #
+    # It allows to reproduce bugs we would have had on a full pytest execution on a configuration
+    # (f_i, c_j, t_k) by calling pytest on this single configuration with the --randomly-seed
+    # parameter and no other arguments.
+    #
+    # In particular, it is resistant to crashes which would prevent the few prints below in this
+    # function, which details some seeding information
 
-    seed = main_seed
-    record_property("main seed", main_seed)
+    randomly_seed = request.config.getoption("--randomly-seed", default=None)
 
-    # Python
-    random.seed(seed)
-    print("\nForcing seed to random.seed to ", seed)
+    if randomly_seed is None:
+        raise ValueError("--randomly-seed has not been properly configured internally")
+
+    # Get the absolute path of the test file
+    absolute_path = str(request.fspath)
+
+    # Find the tests directory by searching for '/tests/' in the path
+    test_dir_index = absolute_path.find("/tests/")
+    if test_dir_index == -1:
+        raise ValueError(
+            "Unable to find '/tests/' directory in the path. "
+            "Make sure the test file is within a '/tests/' directory."
+        )
+
+    # Extract the relative path from the point of the '/tests/' directory
+    relative_file_path = absolute_path[test_dir_index + 1 :]
+
+    # Derive the sub_seed from the randomly_seed and the test name
+    derivation_string = f"{relative_file_path} # {str(request.node.name)} # {randomly_seed}"
+
+    hash_object = hashlib.sha256()
+    hash_object.update(derivation_string.encode("utf-8"))
+    hash_value = hash_object.hexdigest()
+
+    # The hash is a SHA256, so 256b. And random.seed wants a 64b seed and numpy.random.seed wants a
+    # 32b seed. So we reduce a bit
+    sub_seed = int(hash_value, 16) % 2**64
+
+    print(f"\nUsing {randomly_seed=}\nUsing {derivation_string=}\nUsing {sub_seed=}")
+
+    # And then, do everything per this sub_seed
+    seed = sub_seed
+
     print(
-        f"\nRelaunch the tests with --forcing_random_seed {seed} "
-        + "--randomly-dont-reset-seed to reproduce. Remark that adding --randomly-seed=... "
-        + "is needed when the testcase uses randoms in pytest parameters"
+        f"\nRelaunch the tests with --randomly-seed {randomly_seed} "
+        + "--randomly-dont-reset-seed to reproduce."
     )
     print(
         "Remark that potentially, any option used in the pytest call may have an impact so in "
         + "case of problem to reproduce, you may want to have a look to `make pytest` options"
     )
+
+    # Python
+    random.seed(seed)
 
     # Numpy
     seed += 1
@@ -206,7 +270,8 @@ def autoseeding_of_everything(record_property, request):
     # Seed torch
     seed += 1
     function_to_seed_torch(seed)
-    return {"main seed": main_seed}
+
+    return {"randomly seed": randomly_seed}
 
 
 @pytest.fixture
@@ -214,6 +279,20 @@ def is_weekly_option(request):
     """Say if we are in --weekly configuration."""
     is_weekly = request.config.getoption("--weekly")
     return is_weekly
+
+
+@pytest.fixture
+def get_device_for_compilation(request):
+    """Get the hardware device to compile circuits in tests."""
+
+    def get_device_for_compilation_impl(fhe_mode):
+        use_gpu = request.config.getoption("--use_gpu")
+        device_for_tests = "cuda" if use_gpu else "cpu"
+        if fhe_mode == "execute":
+            return device_for_tests
+        return "cpu"
+
+    return get_device_for_compilation_impl
 
 
 # Method is not ideal as some MLIR can contain TLUs but not the associated graph
@@ -367,7 +446,7 @@ def check_accuracy():
     """Fixture to check the accuracy."""
 
     def check_accuracy_impl(expected, actual, threshold=0.9):
-        accuracy = numpy.mean(expected == actual)
+        accuracy = accuracy_score(expected, actual)
         assert accuracy >= threshold, f"Accuracy of {accuracy} is not high enough ({threshold})."
 
     return check_accuracy_impl
@@ -479,8 +558,8 @@ def check_is_good_execution_for_cml_vs_circuit():
         for _ in range(n_allowed_runs):
             # Check if model is QuantizedModule
             if isinstance(model, QuantizedModule):
-                results_cnp_circuit = model.forward(*inputs, fhe=fhe_mode)
-                results_model = model.forward(*inputs, fhe="disable")
+                y_pred_fhe = model.forward(*inputs, fhe=fhe_mode)
+                y_pred_quantized = model.forward(*inputs, fhe="disable")
 
             else:
                 assert isinstance(
@@ -504,12 +583,12 @@ def check_is_good_execution_for_cml_vs_circuit():
                     if is_classifier_or_partial_classifier(model) and not isinstance(
                         model, SklearnKNeighborsMixin
                     ):
-                        results_cnp_circuit = model.predict_proba(*inputs, fhe=fhe_mode)
-                        results_model = model.predict_proba(*inputs, fhe="disable")
+                        y_pred_fhe = model.predict_proba(*inputs, fhe=fhe_mode)
+                        y_pred_quantized = model.predict_proba(*inputs, fhe="disable")
 
                     else:
-                        results_cnp_circuit = model.predict(*inputs, fhe=fhe_mode)
-                        results_model = model.predict(*inputs, fhe="disable")
+                        y_pred_fhe = model.predict(*inputs, fhe=fhe_mode)
+                        y_pred_quantized = model.predict(*inputs, fhe="disable")
 
                 else:
                     raise ValueError(
@@ -517,12 +596,12 @@ def check_is_good_execution_for_cml_vs_circuit():
                         "a QuantizedModule object."
                     )
 
-            if array_allclose_and_same_shape(results_cnp_circuit, results_model):
+            if array_allclose_and_same_shape(y_pred_fhe, y_pred_quantized):
                 return
 
         raise RuntimeError(
-            f"Mismatch between circuit results:\n{results_cnp_circuit}\n"
-            f"and model function results:\n{results_model}"
+            f"Mismatch between circuit results:\n{y_pred_fhe}\n"
+            f"and model function results:\n{y_pred_quantized}"
         )
 
     return check_is_good_execution_for_cml_vs_circuit_impl
