@@ -1,8 +1,36 @@
 """Pytest JSON report on failed tests utils."""
+
 import argparse
 import json
 from pathlib import Path
 from typing import Dict, Optional
+
+
+def write_failed_tests_list(failed_tests_list_path: Path, failed_tests_report: Dict):
+    """Write the list of failed tests as a text file.
+
+    Args:
+        failed_tests_list_path (Path): Path where to write the list.
+        failed_tests_report (Dict): Formatted report of failed tests.
+    """
+    with open(failed_tests_list_path, "w", encoding="utf-8") as f:
+
+        # If at least one test failed, write the list
+        if failed_tests_report["tests_failed"]:
+
+            # Write all flaky tests that initially failed as a list
+            f.write("- Known flaky tests :warning:: \n")
+            for flaky_name in failed_tests_report["flaky"]:
+                f.write("    - " + flaky_name)
+
+            # Write all other tests that failed as a list if they were not all known
+            # flaky tests
+            if not failed_tests_report["all_failed_tests_are_flaky"]:
+                f.write("\n")
+
+                f.write("- Other failed tests ❌: \n")
+                for non_flaky_name in failed_tests_report["non_flaky"]:
+                    f.write("    - " + non_flaky_name)
 
 
 def write_failed_tests_comment(failed_tests_comment_path: Path, failed_tests_report: Dict):
@@ -19,16 +47,17 @@ def write_failed_tests_comment(failed_tests_comment_path: Path, failed_tests_rep
 
             # Write the comment's title and main header
             if failed_tests_report["all_failed_tests_are_flaky"]:
-                f.write("## :warning: Known flaky tests have been re-run :warning:\n\n")
+                f.write("## :warning: Known flaky tests have been rerun :warning:\n\n")
                 failed_tests_header = (
-                    "One or several tests initially failed but were detected as known flaky tests. "
-                    "They therefore have been re-run and passed. See below for more details.\n\n"
+                    "One or several tests initially failed but were identified as known flaky. "
+                    "tests. Therefore, they have been rerun and passed. See below for more "
+                    "details.\n\n"
                 )
             else:
-                f.write("## ❌ Some tests failed after re-run ❌\n\n")
+                f.write("## ❌ Some tests failed after rerun ❌\n\n")
                 failed_tests_header = (
-                    "At least one of the following tests initially failed. They therefore have "
-                    "been re-run but failed again. See below for more details.\n\n"
+                    "At least one of the following tests initially failed. They have therefore "
+                    "been rerun but failed again. See below for more details.\n\n"
                 )
 
             f.writelines(failed_tests_header)
@@ -54,10 +83,11 @@ def write_failed_tests_comment(failed_tests_comment_path: Path, failed_tests_rep
             f.write("\n\n</p>\n</details>\n\n")
 
 
-def write_failed_tests_report(
+def write_failed_tests_reports(
     failed_tests_report_path: Path,
     input_report: Dict,
     failed_tests_comment_path: Optional[Path] = None,
+    failed_tests_list_path: Optional[Path] = None,
 ):
     """Write a formatted report of failed tests as a JSON file.
 
@@ -67,6 +97,8 @@ def write_failed_tests_report(
         failed_tests_report_path (Path): Path where to write the formatted report of failed tests.
         input_report (Dict): Pytest overall report.
         failed_tests_comment_path (Optional[Path]): Path where to write the formatted PR comment.
+            If None, no file is written. Default to None.
+        failed_tests_list_path (Optional[Path]): Path where to write the list of failed tests.
             If None, no file is written. Default to None.
     """
     # Safest default parameters
@@ -97,8 +129,14 @@ def write_failed_tests_report(
                 else:
                     failed_tests_report["non_flaky"].append(test_name)  # type: ignore[attr-defined]
 
-        # If no non-flaky tests failed, report that all failed tests were known flaky tests
-        if not failed_tests_report["non_flaky"]:
+        # If there are some flaky tests but no non-flaky tests failed, report that all failed tests
+        # were known flaky tests
+        # We need to make sure that at least one flaky test has been detected for one specific
+        # reason: if, for example, a test file has a syntax error, pytest will "crash" and therefore
+        # won't collect any tests in the file. The problem is that this will return an 'exitcode'
+        # of 1, making this script unexpectedly return 'all_failed_tests_are_flaky=True' in the
+        # case where 'failed_tests_report["non_flaky"]' is empty
+        if failed_tests_report["flaky"] and not failed_tests_report["non_flaky"]:
             failed_tests_report["all_failed_tests_are_flaky"] = True
 
     else:
@@ -111,6 +149,10 @@ def write_failed_tests_report(
     # Write the PR comment if a path is given
     if failed_tests_comment_path is not None:
         write_failed_tests_comment(failed_tests_comment_path, failed_tests_report)
+
+    # Write list of failed tests if a path is given
+    if failed_tests_list_path is not None:
+        write_failed_tests_list(failed_tests_list_path, failed_tests_report)
 
 
 def main(args):
@@ -132,8 +174,15 @@ def main(args):
     if failed_tests_comment_path is not None:
         failed_tests_comment_path = Path(failed_tests_comment_path).resolve()
 
-    write_failed_tests_report(
-        failed_tests_report_path, input_report, failed_tests_comment_path=failed_tests_comment_path
+    failed_tests_list_path = args.failed_tests_list
+    if failed_tests_list_path is not None:
+        failed_tests_list_path = Path(failed_tests_list_path).resolve()
+
+    write_failed_tests_reports(
+        failed_tests_report_path,
+        input_report,
+        failed_tests_comment_path=failed_tests_comment_path,
+        failed_tests_list_path=failed_tests_list_path,
     )
 
 
@@ -156,6 +205,11 @@ if __name__ == "__main__":
         "--failed-tests-comment",
         type=str,
         help="Path where to write the warning comment for failed tests as a txt file",
+    )
+    parser.add_argument(
+        "--failed-tests-list",
+        type=str,
+        help="Path where to write the list of failed tests as a txt file",
     )
 
     cli_args = parser.parse_args()

@@ -8,9 +8,9 @@
 from typing import Any, Dict, Optional, Sequence, Set, Union
 
 import numpy
-from concrete.fhe import conv as cnp_conv
-from concrete.fhe import maxpool as cnp_maxpool
-from concrete.fhe import tag
+from concrete.fhe import conv as fhe_conv
+from concrete.fhe import maxpool as fhe_maxpool
+from concrete.fhe import tag, univariate, zeros
 from typing_extensions import SupportsIndex
 
 from ..common.debugging import assert_false, assert_true
@@ -26,7 +26,12 @@ from .base_quantized_op import (
     QuantizedOp,
     QuantizedOpUnivariateOfEncrypted,
 )
-from .quantizers import QuantizationOptions, QuantizedArray, UniformQuantizationParameters
+from .quantizers import (
+    QuantizationOptions,
+    QuantizedArray,
+    UniformQuantizationParameters,
+    UniformQuantizer,
+)
 
 
 def _check_op_input_zero_point(zero_point: Any, op_name: Optional[str]):
@@ -134,9 +139,9 @@ class QuantizedGemm(QuantizedMixingOp):
         self,
         n_bits_output: int,
         op_instance_name: str,
-        int_input_names: Set[str] = None,
+        int_input_names: Optional[Set[str]] = None,
         constant_inputs: Optional[Union[Dict[str, Any], Dict[int, Any]]] = None,
-        input_quant_opts: QuantizationOptions = None,
+        input_quant_opts: Optional[QuantizationOptions] = None,
         **attrs,
     ) -> None:
         super().__init__(
@@ -157,13 +162,11 @@ class QuantizedGemm(QuantizedMixingOp):
             f"Got alpha == {alpha} and beta == {beta}.",
         )
 
-        assert_true(
-            1 in self.constant_inputs,
-            f"{self.__class__.__name__} currently only supports quantizing "
-            f"{self._impl_for_op_named} if weights are provided as the 'b' constant input.",
-        )
+    @classmethod
+    def supported_by_linear_backend(cls) -> bool:
+        return True
 
-    # pylint: disable-next=too-many-statements
+    # pylint: disable-next=too-many-statements,too-many-locals
     def q_impl(
         self,
         *q_inputs: ONNXOpInputOutputType,
@@ -174,41 +177,59 @@ class QuantizedGemm(QuantizedMixingOp):
         alpha = self.attrs.get("alpha", 1)
         beta = self.attrs.get("beta", 1)
 
+        # If self.constant_inputs is empty this is an encrypted gemm
+        # There might be caveats here
+        # (for example when one of the input is passed in clear with encrypted statuses.)
+        # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4132
+        is_encrypted_gemm = isinstance(self.constant_inputs, dict) and not self.constant_inputs
+
         # If alpha != 1 or beta not in [0, 1], this function must be modified
         assert_true(alpha == 1)
-        assert_true(beta in [0, 1])
+        assert_true(beta in {0, 1})
 
         prepared_inputs = self._prepare_inputs_with_constants(
             *q_inputs, calibrate=False, quantize_actual_values=True
         )
 
-        q_input: QuantizedArray = prepared_inputs[0]
-        q_weights: QuantizedArray = prepared_inputs[1]
-        q_bias: Optional[QuantizedArray] = (
-            None if len(prepared_inputs) == 2 or beta == 0 else prepared_inputs[2]
-        )
+        q_input1 = prepared_inputs[0]
+        assert isinstance(q_input1, QuantizedArray)
+        q_input2 = prepared_inputs[1]
+        assert isinstance(q_input2, QuantizedArray)
+
+        # In the operation Y = alpha * A' * B' + beta * C, q_bias is used for
+        # generalised matrix multiplication. q_bias is set to None for standard
+        # matrix multiplication (beta == 0 or only two inputs)
+        q_bias = None if len(prepared_inputs) == 2 or beta == 0 else prepared_inputs[2]
+        assert isinstance(q_bias, (type(None), QuantizedArray))
 
         # Using snake case here to please the Python format, the original attrs don't have the '_'
         # Use default false so we also support MatMul impl, MatMul does not have these flags
-        transpose_inputs = attrs.get("transA", False)
-        transpose_w = attrs.get("transB", False)
-
+        transpose_inputs1 = attrs.get("transA", False)
         with tag(self.op_instance_name + ".input"):
-            input_q_values = (
-                numpy.transpose(q_input.qvalues) if transpose_inputs else q_input.qvalues
+            input1_q_values = (
+                numpy.transpose(q_input1.qvalues) if transpose_inputs1 else q_input1.qvalues
             )
-        weights_q_values = numpy.transpose(q_weights.qvalues) if transpose_w else q_weights.qvalues
+
+        transpose_inputs2 = attrs.get("transB", False)
+        input2_q_values = (
+            numpy.transpose(q_input2.qvalues) if transpose_inputs2 else q_input2.qvalues
+        )
+
+        assert_true(
+            input2_q_values.ndim in {2, 3},
+            f"Unsupported dimension for the weight input of the gemm: {input2_q_values.ndim}",
+        )
 
         # For mypy
         assert self.output_quant_params is not None
         assert self.output_quant_params.scale is not None
         assert self.output_quant_params.zero_point is not None
 
-        assert q_weights.quantizer.scale is not None
-        assert q_weights.quantizer.zero_point is not None
+        assert q_input2.quantizer.scale is not None
+        assert q_input2.quantizer.zero_point is not None
 
-        assert q_input.quantizer.scale is not None
-        assert q_input.quantizer.zero_point is not None
+        assert q_input1.quantizer.scale is not None
+        assert q_input1.quantizer.zero_point is not None
 
         # The following MatMul is done with integers, and thus, does not use of any PBS.
         # Rescaling the output of the integer MatMul to handle scale changes is done
@@ -217,20 +238,164 @@ class QuantizedGemm(QuantizedMixingOp):
         # Here we follow Eq.7 in https://arxiv.org/abs/1712.05877 to split the core computation
         # from the zero points and scales.
 
-        p = weights_q_values.shape[0]
+        p = input2_q_values.shape[-2]
+
+        # Remove the manual matrix multiplication when we can handle input precision with rounding
+        # FIXME: https://github.com/zama-ai/concrete-internal/issues/512
+        def enc_mul(x, y):
+            r"""Encrypted multiplication of two input arrays.
+
+            This function computes the encrypted multiplication of two numpy arrays.
+            It uses the following equality:
+
+            \[
+            (x + y)^2 - (x - y)^2 = 4xy
+            \]
+
+            This equation simplifies to the standard multiplication operation.
+
+            In TFHE, this allows to do encrypted multiplication with 2 PBS.
+
+            Args:
+                x (numpy.ndarray): The first input numpy array.
+                y (numpy.ndarray): The second input numpy array.
+
+            Returns:
+                numpy.ndarray: The result of the encrypted multiplication.
+            """
+            with tag("pbs_multiplication"):
+                # Compute sum and difference of x and y
+                add = x + y
+                sub = x - y
+
+                # Apply Concrete rounding to the addition and substraction
+                with tag(self.op_instance_name + ".pbs_matmul_rounding_add"):
+                    add = self.cnp_round(add, calibrate_rounding, rounding_operation_id="add")
+                with tag(self.op_instance_name + ".pbs_matmul_rounding_sub"):
+                    sub = self.cnp_round(sub, calibrate_rounding, rounding_operation_id="sub")
+
+                # Square the rounded sums and differences, and divide by 4
+                add_pow = (add.astype(numpy.float64)) ** 2
+                sub_pow = (sub.astype(numpy.float64)) ** 2
+                add_pow_divide = (add_pow / 4.0).astype(numpy.int64)
+                sub_pow_divide = (sub_pow / 4.0).astype(numpy.int64)
+
+            # Return the result of the multiplication
+            return add_pow_divide - sub_pow_divide
+
+        # Remove the manual matrix multiplication when we can handle input precision with rounding
+        # FIXME: https://github.com/zama-ai/concrete-internal/issues/512
+        def matmul(a, b):
+            """Matrix multiplication of two input arrays, supporting 2D or 3D.
+
+            This function performs matrix multiplication on either 2D or 3D numpy arrays.
+            It supports batch processing, where either or both inputs can be a batch
+            (3D array), and handles the reshaping and summation operations required
+            for matrix multiplication.
+
+            Args:
+                a (numpy.ndarray): The first input array, can be 2D or 3D.
+                b (numpy.ndarray): The second input array, can be 2D or 3D.
+
+            Returns:
+                numpy.ndarray: The result of the matrix multiplication.
+            """
+            with tag("encrypted_matmul"):
+                # Determine the dimensions of inputs and handle 3D (batch) inputs
+                a_3d = a.ndim == 3
+                b_3d = b.ndim == 3
+
+                # Extract shapes and batch sizes
+                if a_3d:
+                    batch_a, m, n = a.shape
+                else:
+                    m, n = a.shape
+                    batch_a = 1
+
+                if b_3d:
+                    batch_b, n_b, p = b.shape
+                else:
+                    n_b, p = b.shape
+                    batch_b = 1
+
+                # Check for dimension compatibility
+                assert_true(n == n_b, "Inner dimensions do not match for matrix multiplication")
+                assert (
+                    batch_a == batch_b or batch_a == 1 or batch_b == 1
+                ), "Batch sizes must be equal or one must be 1"
+
+                # Determine the batch size for the operation
+                batch_size = batch_a
+                c = zeros(shape=(batch_size, m, p))
+
+                # Perform batched matrix multiplication
+                for i in range(batch_size):
+                    # Slice the batch or use the whole array if not batched
+                    a_slice = a[i] if a_3d else a
+                    b_slice = b[i] if b_3d else b
+
+                    # Reshape for element-wise multiplication
+                    a_reshaped = a_slice.reshape((m, n, 1))
+                    b_reshaped = b_slice.reshape((1, n, p))
+
+                    # Perform encrypted multiplication and sum along the axis
+                    enc_mul_result = enc_mul(a_reshaped, b_reshaped)
+                    c[i] = numpy.sum(enc_mul_result, axis=1)
+
+                # Squeeze the first dimension if both inputs were 2D
+                if not a_3d and not b_3d:
+                    c = numpy.squeeze(c, axis=0)
+
+                # Return the result of matrix multiplication
+                return c
+
+        # Remove the manual matrix multiplication when we can handle input precision with rounding
+        # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4127
+        @univariate
+        def copy_function(x):
+            return x
+
+        # Copy trick explanation:
+        # The copy_function is used to preserve the original precision of input values across
+        # various operations. Operations like addition, subtraction, sum, and matmul can
+        # unintentionally increase precision ('precision raising').
+        #
+        # Precision raising in one of these operations can inadvertently affect the precision of
+        # the same value in other branches of the code. By creating copies of the input values,
+        # any precision changes are limited to these copies, not the original values.
+        #
+        # This strategy is particularly important to make sure PBS in all branches are done on the
+        # pre-defined precision. The use of the copy is conditional, applied only when needed
+        # to optimize performance.
+
+        input1_q_values_copy = (
+            copy_function(input1_q_values) if is_encrypted_gemm else input1_q_values
+        )
+        input2_q_values_copy = (
+            copy_function(input2_q_values) if is_encrypted_gemm else input2_q_values
+        )
 
         # Core matmul operation in full integers with a shape change (INTEGERS)
         with tag(self.op_instance_name + ".matmul"):
-            matmul = input_q_values @ weights_q_values
+            # We implement our own encrypted matmul to be able to round before PBS
+            if is_encrypted_gemm:
+                matmul = matmul(input1_q_values_copy, input2_q_values_copy)
+            # Otherwise we let concrete do it
+            else:
+                matmul = input1_q_values_copy @ input2_q_values_copy
+
+        input1_q_values_copy = (
+            copy_function(input1_q_values) if is_encrypted_gemm else input1_q_values
+        )
 
         # If the weights have symmetric quantization, their zero point will be 0
         # The following check avoids the computation of the sum of the inputs, which may have
         # large bit-width, in the case where it would be multiplied by zero
-        if q_weights.quantizer.zero_point != 0:
+        if q_input2.quantizer.zero_point != 0:
             # Sum operation in full integers resulting in large integers (INTEGERS)
             with tag(self.op_instance_name + ".matmul_inputsum"):
-                sum_input = -q_weights.quantizer.zero_point * numpy.sum(
-                    input_q_values, axis=1, keepdims=True
+                sum_input = -q_input2.quantizer.zero_point * numpy.sum(
+                    input1_q_values_copy, axis=-1, keepdims=True
                 )
 
             with tag(self.op_instance_name + ".matmul_add_inputsum"):
@@ -243,22 +408,28 @@ class QuantizedGemm(QuantizedMixingOp):
             # pylint: disable-next=unsubscriptable-object
             self.debug_value_tracker[self.op_instance_name]["output"] = numpy_q_out  # type: ignore
 
-        # sum_weights is a constant
-        sum_weights = q_input.quantizer.zero_point * numpy.sum(
-            weights_q_values, axis=0, keepdims=True
+        input2_q_values_copy = (
+            copy_function(input2_q_values) if is_encrypted_gemm else input2_q_values
         )
 
-        final_term = p * q_input.quantizer.zero_point * q_weights.quantizer.zero_point
+        with tag(self.op_instance_name + ".sum_weights_times_zero_point"):
+
+            # sum_weights is a constant
+            sum_weights = q_input1.quantizer.zero_point * numpy.sum(
+                input2_q_values_copy, axis=-2, keepdims=True
+            )
+
+        final_term = p * q_input1.quantizer.zero_point * q_input2.quantizer.zero_point
 
         # Note that here we do not rescale to the output_scale and we do not add a zero-point
         # Any following Gemm/MatMul/Conv layers will do the rescaling (during re-quantization)
         # by calling _prepare_inputs_with_constants(...quantize_real_values=True)
-        m_matmul = q_input.quantizer.scale * q_weights.quantizer.scale
+        m_matmul = q_input1.quantizer.scale * q_input2.quantizer.scale
 
         # If this operation's result are network outputs, return
         # directly the integer values and a appropriate quantization parameters that
         # allow direct in-the-clear de-quantization, including the bias
-        if self.produces_graph_output:
+        if self.produces_graph_output and not is_encrypted_gemm:
             out_zp: Union[int, numpy.ndarray] = sum_weights - final_term
             if q_bias is not None:
                 # Make mypy happy
@@ -281,13 +452,30 @@ class QuantizedGemm(QuantizedMixingOp):
             assert numpy.isclose(q_bias.quantizer.scale, m_matmul)
             numpy_q_out += q_bias.qvalues
 
-        with tag(self.op_instance_name + ".matmul_rounding"):
-            # Apply Concrete rounding (if relevant)
-            numpy_q_out = self.cnp_round(numpy_q_out, calibrate_rounding)
+        # If weights are not encrypted then we can round as the next
+        # line is going to be done in a PBS
+        if not is_encrypted_gemm:
+            with tag(self.op_instance_name + ".matmul_rounding"):
+                # Apply Concrete rounding (if relevant)
+                numpy_q_out = self.cnp_round(
+                    numpy_q_out, calibrate_rounding, rounding_operation_id="matmul"
+                )
 
-        # Quantization scales and zero points (FLOATS involved)
-        # This is going to be compiled with a PBS (along with the following activation function)
-        numpy_q_out = numpy_q_out.astype(numpy.float64) + final_term - sum_weights
+                # Force a PBS with astype float64
+                numpy_q_out = numpy_q_out.astype(numpy.float64)
+
+        # Quantization scales and zero points
+        # This is done in a PBS if is_encrypted_gemm == False
+        # (along with the following activation function)
+        # Otherwise it is done in FHE
+        numpy_q_out = numpy_q_out + final_term - sum_weights
+
+        if is_encrypted_gemm:
+            with tag(self.op_instance_name + ".matmul_rounding"):
+                # Apply Concrete rounding (if relevant)
+                numpy_q_out = self.cnp_round(
+                    numpy_q_out, calibrate_rounding, rounding_operation_id="matmul"
+                )
 
         numpy_q_out = m_matmul * numpy_q_out
 
@@ -307,6 +495,68 @@ class QuantizedGemm(QuantizedMixingOp):
             params=self.output_quant_params,
         )
 
+    def calibrate_analytical_output(self, *inputs: QuantizedArray) -> UniformQuantizer:
+        """Calibrate output quantization based on analytical formulas.
+
+        Args:
+            *inputs (QuantizedArray): quantized operation inputs. Quantized weights
+                are stored in the op instance
+
+        Returns:
+            res (UniformQuantizer): the quantizer of the operation's output values
+                that can be used to de-quantize these values.
+        """
+
+        q_input1 = inputs[0]
+        assert isinstance(q_input1, QuantizedArray)
+        q_input2 = inputs[1]
+        assert isinstance(q_input2, QuantizedArray)
+
+        # In the operation Y = alpha * A' * B' + beta * C, q_bias is used for
+        # generalised matrix multiplication. q_bias is set to None for standard
+        # matrix multiplication (beta == 0 or only two inputs)
+        q_bias = None if len(inputs) == 2 or self.attrs["beta"] == 0 else inputs[2]
+        assert isinstance(q_bias, (type(None), QuantizedArray))
+
+        # Using snake case here to please the Python format, the original attrs don't have the '_'
+        # Use default false so we also support MatMul impl, MatMul does not have these flags
+        transpose_inputs2 = self.attrs.get("transB", False)
+
+        p = q_input2.qvalues.shape[-2]
+
+        assert q_input1.quantizer.scale is not None
+        assert q_input2.quantizer.scale is not None
+        m_matmul = q_input1.quantizer.scale * q_input2.quantizer.scale
+
+        input2_q_values = (
+            numpy.transpose(q_input2.qvalues) if transpose_inputs2 else q_input2.qvalues
+        )
+
+        # Compute the third term, the sum of the weights which is a constant
+        sum_weights = q_input1.quantizer.zero_point * numpy.sum(
+            input2_q_values, axis=-2, keepdims=True
+        )
+
+        assert q_input1.quantizer.zero_point is not None
+        assert q_input2.quantizer.zero_point is not None
+        final_term = p * q_input1.quantizer.zero_point * q_input2.quantizer.zero_point
+
+        out_zp: Union[int, numpy.ndarray] = sum_weights - final_term
+        if q_bias is not None:
+            # Make mypy happy
+            assert q_bias is not None
+            # Reshape the biases to broadcast them to each neuron
+            bias_out = q_bias.values if isinstance(q_bias, QuantizedArray) else q_bias
+            out_zp = out_zp + bias_out / (-m_matmul)
+
+        out_params = UniformQuantizationParameters(
+            scale=m_matmul,
+            zero_point=out_zp,
+            offset=0,
+        )
+
+        return UniformQuantizer(self._get_output_quant_opts(), self.output_quant_stats, out_params)
+
 
 class QuantizedMatMul(QuantizedGemm):
     """Quantized MatMul op."""
@@ -314,7 +564,7 @@ class QuantizedMatMul(QuantizedGemm):
     _impl_for_op_named: str = "MatMul"
 
 
-class QuantizedAdd(QuantizedOp):
+class QuantizedAdd(QuantizedMixingOp):
     """Quantized Addition operator.
 
     Can add either two variables (both encrypted) or a variable and a constant
@@ -328,7 +578,6 @@ class QuantizedAdd(QuantizedOp):
         *q_inputs: ONNXOpInputOutputType,
         **attrs,
     ) -> ONNXOpInputOutputType:
-
         # If operating over all raw inputs, just perform the op in the clear
         if all(isinstance(q_input, RawOpOutput) for q_input in q_inputs):
             prepared_inputs = self._prepare_inputs_with_constants(
@@ -376,38 +625,45 @@ class QuantizedAdd(QuantizedOp):
         assert q_input_1.quantizer.scale is not None
         assert q_input_1.quantizer.zero_point is not None
 
-        # De-quantize with input params and re-quantize with output parameters
-        # This will use TLUs over each element of the two inputs
-        # We do the de-quantization directly, instead of q_inputs[0].dequant(),
-        # So that we do not lose precision in the computation
+        # Dequantize
+        input_0 = q_input_0.dequant()
+        input_1 = q_input_1.dequant()
 
-        rescale_q0 = numpy.rint(
-            q_input_0.quantizer.scale
-            / self.output_quant_params.scale
-            * (q_input_0.qvalues + (-q_input_0.quantizer.zero_point))
-        ).astype(numpy.int64)
+        # If this operator is the last one in the graph,
+        # we rescale using the smallest scale to keep all information
+        if self.produces_graph_output:
+            common_scale = min(q_input_0.quantizer.scale, q_input_1.quantizer.scale)
+        # Otherwise we use the output op quantization scale
+        else:
+            common_scale = self.output_quant_params.scale
 
-        rescale_q1 = numpy.rint(
-            q_input_1.quantizer.scale
-            / self.output_quant_params.scale
-            * (q_input_1.qvalues + (-q_input_1.quantizer.zero_point))
-        ).astype(numpy.int64)
+        common_zero_point = 0
+        offset = 0
+
+        output_quant_params = UniformQuantizationParameters(
+            scale=common_scale,
+            zero_point=common_zero_point,
+            offset=offset,
+        )
+
+        quantizer = UniformQuantizer(params=output_quant_params, no_clipping=True)
+
+        # Re-quantize using the common quantization paramaters
+        q_input_0_rescaled = quantizer.quant(input_0)
+        q_input_1_rescaled = quantizer.quant(input_1)
 
         # The sum of quantized encrypted integer values
         # This sum has << max(in_bits0, in_bits1) + 1 >> bits
         # Moreover, the zero-point will be sum of input zero-points
         assert self.b_sign in [-1, 1]
 
-        # This lines will be simplified into
-        #       sum_q = rescale_q0 + self.b_sign * rescale_q1
-        # when zama-ai/concrete-numpy-internal#1749 is done
-        if self.b_sign == 1:
-            sum_q = rescale_q0 + rescale_q1
-        elif self.b_sign == -1:
-            sum_q = rescale_q0 - rescale_q1
+        sum_q = q_input_0_rescaled + self.b_sign * q_input_1_rescaled
+
+        if self.produces_graph_output:
+            return self.make_output_quant_parameters(sum_q, common_scale, common_zero_point)
 
         # But we would like the output to have n_bits, so we de-quantize
-        dequant_sum = self.output_quant_params.scale * sum_q
+        dequant_sum = quantizer.dequant(sum_q)
 
         # Return the raw float values without re-quantizing them to the new scale, as any
         # following Gemm/Add/Conv will quantize them with _prepare_inputs_with_constants(...)
@@ -527,11 +783,10 @@ class QuantizedReshape(QuantizedOp):
     def can_fuse(self) -> bool:
         """Determine if this op can be fused.
 
-        Max Pooling operation can not be fused since it must be performed over integer tensors and
-        it combines different elements of the input tensors.
+        Reshape operation can not be fused since it must be performed over integer tensors.
 
         Returns:
-            bool: False, this operation can not be fused as it adds different encrypted integers
+            bool: False, this operation can not be fused.
         """
         return False
 
@@ -587,8 +842,9 @@ class QuantizedConv(QuantizedMixingOp):
 
         # Validate the parameters
         assert_true(
-            len(self.kernel_shape) == 2,
-            "The convolution operator currently supports only 2d",
+            len(self.kernel_shape) in (1, 2),
+            "The convolution operator currently only supports 1d or 2d. "
+            f"Got {len(self.kernel_shape)}-d",
         )
         assert_true(
             len(self.kernel_shape) == len(self.strides),
@@ -597,7 +853,7 @@ class QuantizedConv(QuantizedMixingOp):
         )
         assert_true(
             bool(numpy.all(numpy.asarray(self.dilations) == 1)),
-            "The convolution operator in Concrete does not suppport dilation",
+            "The convolution operator in Concrete does not support dilation",
         )
         assert_true(
             len(self.pads) == 2 * len(self.kernel_shape),
@@ -606,7 +862,7 @@ class QuantizedConv(QuantizedMixingOp):
             " standard",
         )
 
-    # pylint: disable-next=too-many-statements
+    # pylint: disable-next=too-many-statements, too-many-locals
     def q_impl(
         self,
         *q_inputs: ONNXOpInputOutputType,
@@ -657,9 +913,6 @@ class QuantizedConv(QuantizedMixingOp):
             f"group ({self.group}).",
         )
 
-        # Prepare a constant tensor to compute the sum of the inputs
-        q_weights_1 = numpy.ones_like(q_weights.qvalues)
-
         assert q_weights.quantizer.scale is not None
         assert q_weights.quantizer.zero_point is not None
 
@@ -672,6 +925,25 @@ class QuantizedConv(QuantizedMixingOp):
         pad_value = int(q_input.quantizer.zero_point)
         q_input_pad = numpy_onnx_pad(q_input.qvalues, self.pads, pad_value, True)
 
+        is_conv1d = len(self.kernel_shape) == 1
+
+        q_weights_values = q_weights.qvalues
+        kernel_shape = self.kernel_shape
+        strides = self.strides
+        dilations = self.dilations
+
+        # Workaround for handling torch's Conv1d operator until it is supported by Concrete Python
+        # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4117
+        if is_conv1d:
+            q_input_pad = numpy.expand_dims(q_input_pad, axis=-2)
+            q_weights_values = numpy.expand_dims(q_weights_values, axis=-2)
+            kernel_shape = (1, kernel_shape[0])
+            strides = (1, strides[0])
+            dilations = (1, dilations[0])
+
+        # Prepare a constant tensor to compute the sum of the inputs
+        q_weights_1 = numpy.ones_like(q_weights_values)
+
         # We follow the Quantized Gemm implementation
         # which in turn follows Eq.7 in https://arxiv.org/abs/1712.05877
         # to split the core computation from the zero points and scales.
@@ -679,21 +951,22 @@ class QuantizedConv(QuantizedMixingOp):
         # Compute the first encrypted term that convolves weights and inputs
         # Force padding to 0 as padding needs to use a custom padding initializer
         # and is thus manually performed in the code above
-        fake_pads = [0] * len(self.pads)
+        fake_pads = [0, 0] * len(kernel_shape)
 
         with tag(self.op_instance_name + ".conv"):
-            conv_wx = cnp_conv(
+            conv_wx = fhe_conv(
                 q_input_pad,
-                q_weights.qvalues,
+                q_weights_values,
                 bias=None,
                 pads=fake_pads,
-                strides=self.strides,
-                dilations=self.dilations,
+                kernel_shape=kernel_shape,
+                strides=strides,
+                dilations=dilations,
                 group=self.group,
             )
 
         # The total number of elements that are convolved by the application of a single kernel
-        n_weights = numpy.prod(q_weights.qvalues.shape[1:])
+        n_weights = numpy.prod(q_weights_values.shape[1:])
 
         # If the weights have symmetric quantization, their zero point will be 0
         # The following check avoids the computation of the sum of the inputs, which may have
@@ -706,13 +979,14 @@ class QuantizedConv(QuantizedMixingOp):
                 f"op {self.op_instance_name} must be integer",
             )
             with tag(self.op_instance_name + ".conv_inputsum"):
-                zw_conv_1x = -q_weights.quantizer.zero_point * cnp_conv(
+                zw_conv_1x = -q_weights.quantizer.zero_point * fhe_conv(
                     q_input_pad,
                     q_weights_1,
                     bias=None,
-                    pads=[0, 0, 0, 0],
-                    strides=self.strides,
-                    dilations=self.dilations,
+                    pads=fake_pads,
+                    kernel_shape=kernel_shape,
+                    strides=strides,
+                    dilations=dilations,
                     group=self.group,
                 )
 
@@ -721,14 +995,22 @@ class QuantizedConv(QuantizedMixingOp):
         else:
             numpy_q_out = conv_wx
 
+        # Workaround for handling torch's Conv1d operator until it is supported by Concrete Python
+        # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4117
+        if is_conv1d:
+            numpy_q_out = numpy.squeeze(numpy_q_out, axis=-2)
+
         if self.debug_value_tracker is not None:
             # pylint: disable-next=unsubscriptable-object
             self.debug_value_tracker[self.op_instance_name]["output"] = numpy_q_out
 
+        weight_sum_axes = (1, 2) if is_conv1d else (1, 2, 3)
+        weight_transpose_axes = (1, 0, 2) if is_conv1d else (1, 0, 2, 3)
+
         # Compute the third term, the sum of the weights which is a constant
         sum_weights = q_input.quantizer.zero_point * numpy.sum(
-            q_weights.qvalues, axis=(1, 2, 3), keepdims=True
-        ).transpose(1, 0, 2, 3)
+            q_weights.qvalues, axis=weight_sum_axes, keepdims=True
+        ).transpose(*weight_transpose_axes)
 
         # Compute the forth term which is a constant
         final_term = n_weights * q_input.quantizer.zero_point * q_weights.quantizer.zero_point
@@ -738,6 +1020,8 @@ class QuantizedConv(QuantizedMixingOp):
         # Note that we don't re-quantize the output of the conv, this will be done by
         # any Gemm/Add/Conv layers that follow
         m_matmul = q_input.quantizer.scale * q_weights.quantizer.scale
+
+        bias_shape = (1, -1, 1) if is_conv1d else (1, -1, 1, 1)
 
         # If this operation's result are network outputs, return
         # directly the integer values and an appropriate quantization parameters that
@@ -754,7 +1038,7 @@ class QuantizedConv(QuantizedMixingOp):
             out_zp: Union[int, numpy.ndarray] = sum_weights - final_term
             if q_bias is not None:
                 # Reshape the biases to broadcast them to each channel
-                out_zp = out_zp - q_bias.values.reshape((1, -1, 1, 1)) / m_matmul
+                out_zp = out_zp - q_bias.values.reshape(bias_shape) / m_matmul
 
             # We identify terms in the above equation to determine what
             # the scale/zero-point of the in-the-clear quantizer should be
@@ -766,11 +1050,14 @@ class QuantizedConv(QuantizedMixingOp):
             # The bias scale should be the same scale as the one of the weights * inputs
             assert q_bias.quantizer.scale is not None
             assert numpy.isclose(q_bias.quantizer.scale, m_matmul)
-            numpy_q_out += q_bias.qvalues.reshape((1, -1, 1, 1))
+
+            numpy_q_out += q_bias.qvalues.reshape(bias_shape)
 
         with tag(self.op_instance_name + ".conv_rounding"):
             # Apply Concrete rounding (if relevant)
-            numpy_q_out = self.cnp_round(numpy_q_out, calibrate_rounding)
+            numpy_q_out = self.cnp_round(
+                numpy_q_out, calibrate_rounding, rounding_operation_id="matmul"
+            )
 
         # Now compute the whole sum (sum of the four terms)
         numpy_q_out = numpy_q_out.astype(numpy.float64) + final_term - sum_weights
@@ -781,7 +1068,7 @@ class QuantizedConv(QuantizedMixingOp):
         if q_bias is not None and not q_bias.quantizer.is_precomputed_qat:
             # The bias addition is handled in float and will be fused into a TLU
             # Reshape the biases to broadcast them to each channel
-            numpy_q_out = numpy_q_out + q_bias.values.reshape((1, -1, 1, 1))  # bias_part
+            numpy_q_out = numpy_q_out + q_bias.values.reshape(bias_shape)  # bias_part
 
         # And return as a QuantizedArray initialized from the float data, keeping
         # track of the quantization parameters
@@ -821,27 +1108,46 @@ class QuantizedAvgPool(QuantizedMixingOp):
         )
 
         # Get the ONNX parameters
-        self.ceil_mode = attrs.get("ceil_mode", None)
+        self.ceil_mode = attrs.get("ceil_mode", 0)
+        self.auto_pad = attrs.get("auto_pad", "NOTSET")
         self.kernel_shape = attrs.get("kernel_shape", None)
+
+        assert_true(self.kernel_shape is not None, "Setting parameter 'kernel_shape' is required.")
+
+        self.count_include_pad = attrs.get("count_include_pad", 1)
         self.pads = attrs.get("pads", tuple([0] * 2 * (len(self.kernel_shape) - 2)))
         self.dilations = attrs.get("dilations", tuple([1] * len(self.kernel_shape)))
         self.strides = attrs.get("strides", tuple([1] * len(self.kernel_shape)))
 
         # Validate the parameters
         assert_true(
-            len(self.kernel_shape) == 2,
-            "The Average Pool operator currently supports only 2d",
+            self.auto_pad == "NOTSET",
+            "The 'auto_pad' parameter is not supported. Please keep the the default 'NOTSET' value "
+            "and provide explicit padding.",
         )
+
+        assert_true(
+            len(self.kernel_shape) == 2,
+            "The Average Pool operator currently supports only 2d kernels.",
+        )
+
+        assert_true(
+            self.count_include_pad == 1,
+            "Pad pixels must be included when calculating values on the edges. Please set "
+            "'count_include_pad' to 1.",
+        )
+
         assert_true(
             len(self.kernel_shape) == len(self.strides),
-            "The Average Pool operator requires the number of strides to "
-            "be the same as the number of kernel dimensions",
+            "The Average Pool operator requires the number of strides to be the same as the number "
+            "of kernel dimensions.",
         )
+
         assert_true(
             len(self.pads) == 2 * len(self.kernel_shape),
             "The Average Pool operator in Concrete ML requires padding to be specified as "
             " (pad_left_dim1, pad_right_dim1, pad_left_dim2, pad_right_dim2, ...), following ONNX"
-            " standard",
+            " standard.",
         )
 
         self.kernel: Union[numpy.ndarray, None] = None
@@ -914,7 +1220,7 @@ class QuantizedAvgPool(QuantizedMixingOp):
         # on our side, with q_input_pad
         fake_pads = [0] * len(self.pads)
         with tag(self.op_instance_name + ".avgpool"):
-            sum_result = cnp_conv(q_input_pad, kernel, None, fake_pads, self.strides)
+            sum_result = fhe_conv(q_input_pad, kernel, None, fake_pads, self.strides)
 
         with tag(self.op_instance_name + ".avgpool_rounding"):
             # Apply Concrete rounding (if relevant)
@@ -1031,7 +1337,7 @@ class QuantizedMaxPool(QuantizedOp):
         # 0's while we want to pad with zero-point's. So, instead, he have done the padding
         # on our side, with q_input_pad
         fake_pads = [0] * len(self.pads)
-        sum_result = cnp_maxpool(
+        sum_result = fhe_maxpool(
             q_input_pad,
             kernel_shape=self.kernel_shape,
             strides=self.strides,
@@ -1337,24 +1643,280 @@ class QuantizedOr(QuantizedOpUnivariateOfEncrypted, QuantizedOp):
     _impl_for_op_named: str = "Or"
 
 
-class QuantizedDiv(QuantizedOpUnivariateOfEncrypted, QuantizedOp):
-    """Div operator /.
+class QuantizedDiv(QuantizedMixingOp):
+    """Quantized Division operator.
 
-    This operation is not really working as a quantized operation. It just works when things got
-    fused, as in e.g., Act(x) = 1000 / (x + 42))
+    Can divide either two variables (both encrypted) or a variable and a constant
     """
 
     _impl_for_op_named: str = "Div"
 
+    def __init__(
+        self,
+        *args,
+        rounding_threshold_bits: Union[None, int, Dict[str, Union[str, int]]] = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, rounding_threshold_bits=rounding_threshold_bits, **kwargs)
+        self.divider_quantizer: Optional[UniformQuantizer] = None
+        self.min_non_zero_value: Optional[numpy.float64] = None
 
-class QuantizedMul(QuantizedOpUnivariateOfEncrypted, QuantizedOp):
-    """Multiplication operator.
+    def calibrate(self, *inputs: Union[QuantizedArray, numpy.ndarray]) -> numpy.ndarray:
+        """Create corresponding QuantizedArray for the output of the activation function.
 
-    Only multiplies an encrypted tensor with a float constant for now. This operation will
-    be fused to a (potentially larger) TLU.
+        Args:
+            *inputs (Union[QuantizedArray, numpy.ndarray]): Calibration sample inputs.
+
+        Returns:
+            numpy.ndarray: the output values for the provided calibration samples.
+        """
+
+        # If the op can not be fused and that the two inputs are not constants
+        # we need to compute the quantizer of the divider since we are doing
+        # an encrypted division where both numerator and denominator are encrypted
+        if not self.can_fuse() and len(inputs) == 2:
+            assert isinstance(
+                inputs[0], numpy.ndarray
+            ), "Div calibrate does not support analytical calibration for now"
+            assert isinstance(inputs[1], numpy.ndarray)
+
+            # FIXME https://github.com/zama-ai/concrete-ml-internal/issues/4556
+            min_non_zero_index = numpy.abs(inputs[1]).argmin(axis=None)
+            min_non_zero_value = inputs[1].flat[min_non_zero_index]
+
+            # mypy
+            assert min_non_zero_value is not None and min_non_zero_value != 0
+            self.min_non_zero_value = min_non_zero_value
+
+            q_array_divider = QuantizedArray(self.n_bits, 1 / inputs[1])
+
+            # Store the quantizer of the divider
+            self.divider_quantizer = q_array_divider.quantizer
+
+        return super().calibrate(*inputs)
+
+    def q_impl(
+        self,
+        *q_inputs: ONNXOpInputOutputType,
+        calibrate_rounding: bool = False,
+        **attrs,
+    ) -> ONNXOpInputOutputType:
+
+        # If the op can be fused we perform the op in the clear
+        if self.can_fuse():
+            return super().q_impl(*q_inputs, **attrs)
+
+        # For mypy
+        assert self.output_quant_params is not None
+        assert self.output_quant_params.scale is not None
+        assert self.output_quant_params.zero_point is not None
+
+        prepared_inputs = self._prepare_inputs_with_constants(
+            *q_inputs, calibrate=False, quantize_actual_values=True
+        )
+
+        q_input_0: QuantizedArray = prepared_inputs[0]
+        q_input_1: QuantizedArray = prepared_inputs[1]
+
+        assert q_input_0.quantizer.scale is not None
+        assert q_input_0.quantizer.zero_point is not None
+
+        assert q_input_1.quantizer.scale is not None
+        assert q_input_1.quantizer.zero_point is not None
+
+        # Dequantize
+        input_1 = q_input_1.dequant()
+
+        # Replace input_1 with min_non_zero_value if input_1 is 0
+        # mypy
+        assert self.min_non_zero_value is not None
+        input_1 = numpy.where(input_1 == 0, self.min_non_zero_value, input_1)
+
+        # Compute the inverse of input_1
+        input_1_inv = 1.0 / input_1
+
+        # Re-quantize the inverse using the same quantization parameters as q_input_1
+        # mypy
+        assert self.divider_quantizer is not None
+        # FIXME https://github.com/zama-ai/concrete-ml-internal/issues/4556
+        q_input_1_inv_rescaled = self.divider_quantizer.quant(input_1_inv)
+
+        # The product of quantized encrypted integer values
+        product_q_values = q_input_0.qvalues * q_input_1_inv_rescaled
+
+        # mypy
+        assert q_input_0.quantizer.zero_point is not None
+        assert q_input_1.quantizer.zero_point is not None
+        assert self.divider_quantizer.zero_point is not None
+
+        # Integer quantized multiplication need adjustment based on the zero points.
+        if q_input_0.quantizer.zero_point:
+            product_q_values -= q_input_0.quantizer.zero_point * (
+                q_input_1_inv_rescaled - self.divider_quantizer.zero_point
+            )
+        if self.divider_quantizer.zero_point:
+            product_q_values -= self.divider_quantizer.zero_point * (
+                q_input_0.qvalues - q_input_0.quantizer.zero_point
+            )
+
+        # mypy
+        assert self.divider_quantizer.scale is not None
+        assert self.divider_quantizer.zero_point is not None
+
+        # Compute the scale and zero point based on the scale and zero point
+        # of the two quantized values multiplied together
+        new_scale = q_input_0.quantizer.scale * self.divider_quantizer.scale
+        new_zero_point = q_input_0.quantizer.zero_point * self.divider_quantizer.zero_point
+
+        if self.produces_graph_output:
+            return self.make_output_quant_parameters(product_q_values, new_scale, new_zero_point)
+
+        with tag(self.op_instance_name + ".rounding"):
+            # Apply Concrete rounding (if relevant)
+            product_q_values = self.cnp_round(product_q_values, calibrate_rounding)
+
+        # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4546
+        # De-quantize the product
+        dequant_product = (product_q_values - new_zero_point) * new_scale
+
+        # Return the raw float values without re-quantizing them to the new scale, as any
+        # following Gemm/Add/Conv will quantize them with _prepare_inputs_with_constants(...)
+        return QuantizedArray(
+            self.n_bits,
+            dequant_product,
+            value_is_float=True,
+            options=self._get_output_quant_opts(),
+            stats=self.output_quant_stats,
+            params=self.output_quant_params,
+        )
+
+    def can_fuse(self) -> bool:
+        """Determine if this op can be fused.
+
+        Div operation can be computed in float and fused if it operates over inputs produced
+        by a single integer tensor.
+
+        Returns:
+            bool: Whether the number of integer input tensors allows computing this op as a TLU
+        """
+
+        return len(self._int_input_names) == 1
+
+
+class QuantizedMul(QuantizedMixingOp):
+    """Quantized Multiplication operator.
+
+    Can multiply either two variables (both encrypted) or a variable and a constant
     """
 
     _impl_for_op_named: str = "Mul"
+
+    def q_impl(
+        self,
+        *q_inputs: ONNXOpInputOutputType,
+        calibrate_rounding: bool = False,
+        **attrs,
+    ) -> ONNXOpInputOutputType:
+
+        # If either input is a RawOpOutput or if the op can be fused,
+        # perform the op in the TLU using FP32
+        if (
+            len(q_inputs) == 1
+            or isinstance(q_inputs[0], RawOpOutput)
+            or isinstance(q_inputs[1], RawOpOutput)
+            or self.can_fuse()
+        ):
+            return super().q_impl(*q_inputs, **attrs)
+
+        # For mypy
+        assert self.output_quant_params is not None
+        assert self.output_quant_params.scale is not None
+        assert self.output_quant_params.zero_point is not None
+
+        prepared_inputs = self._prepare_inputs_with_constants(
+            *q_inputs, calibrate=False, quantize_actual_values=True
+        )
+
+        q_input_0: QuantizedArray = prepared_inputs[0]
+        q_input_1: QuantizedArray = prepared_inputs[1]
+
+        assert q_input_0.quantizer.scale is not None
+        assert q_input_0.quantizer.zero_point is not None
+
+        assert q_input_1.quantizer.scale is not None
+        assert q_input_1.quantizer.zero_point is not None
+
+        # Remove the manual encrypted multiplication when we
+        # can handle input precision with rounding
+        # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4127
+        @univariate
+        def copy_function(x):
+            return x
+
+        input0_q_values = q_input_0.qvalues
+        input1_q_values = q_input_1.qvalues
+
+        with tag(self.op_instance_name + ".enc_mul_rounding_input0"):
+            input0_q_values = self.cnp_round(
+                input0_q_values, calibrate_rounding, rounding_operation_id="input0_q_values_copy"
+            )
+
+        with tag(self.op_instance_name + ".enc_mul_rounding_input1"):
+            input1_q_values = self.cnp_round(
+                input1_q_values, calibrate_rounding, rounding_operation_id="input1_q_values_copy"
+            )
+
+        input0_q_values = copy_function(input0_q_values)
+        input1_q_values = copy_function(input1_q_values)
+
+        # The product of quantized encrypted integer values
+        product_q_values = input0_q_values * input1_q_values
+
+        # Integer quantized multiplication need adjustment based on the zero points.
+        if q_input_0.quantizer.zero_point:
+            product_q_values -= q_input_0.quantizer.zero_point * input1_q_values
+        if q_input_1.quantizer.zero_point:
+            product_q_values -= q_input_1.quantizer.zero_point * input0_q_values
+
+        # Compute the scale and zero point based on the scale and zero point
+        # of the two quantized values multiplied together
+        new_scale = q_input_0.quantizer.scale * q_input_1.quantizer.scale
+        new_zero_point = q_input_0.quantizer.zero_point * q_input_1.quantizer.zero_point
+
+        if self.produces_graph_output:
+            return self.make_output_quant_parameters(product_q_values, new_scale, new_zero_point)
+
+        with tag(self.op_instance_name + ".rounding"):
+            # Apply Concrete rounding (if relevant)
+            product_q_values = self.cnp_round(
+                product_q_values, calibrate_rounding, rounding_operation_id="product_q_values"
+            )
+
+        # De-quantize the product
+        dequant_product = (product_q_values + new_zero_point) * new_scale
+
+        # Return the raw float values without re-quantizing them to the new scale, as any
+        # following Gemm/Add/Conv will quantize them with _prepare_inputs_with_constants(...)
+        return QuantizedArray(
+            self.n_bits,
+            dequant_product,
+            value_is_float=True,
+            options=self._get_output_quant_opts(),
+            stats=self.output_quant_stats,
+            params=self.output_quant_params,
+        )
+
+    def can_fuse(self) -> bool:
+        """Determine if this op can be fused.
+
+        Mul operation can be computed in float and fused if it operates over inputs produced
+        by a single integer tensor.
+
+        Returns:
+            bool: Whether the number of integer input tensors allows computing this op as a TLU
+        """
+
+        return len(self._int_input_names) == 1
 
 
 class QuantizedSub(QuantizedAdd):
@@ -1371,6 +1933,53 @@ class QuantizedBatchNormalization(QuantizedOp):
     """Quantized Batch normalization with encrypted input and in-the-clear normalization params."""
 
     _impl_for_op_named: str = "BatchNormalization"
+
+    def calibrate(self, *inputs: Union[QuantizedArray, numpy.ndarray]) -> numpy.ndarray:
+        """Create corresponding QuantizedArray for the output of the activation function.
+
+        Args:
+            *inputs (numpy.ndarray): Calibration sample inputs.
+
+        Returns:
+            numpy.ndarray: the output values for the provided calibration samples.
+        """
+
+        assert all(
+            isinstance(inp, numpy.ndarray) for inp in inputs
+        ), "Batch Normalization calibrate does not support analytical calibration"
+
+        # Here we need the actual values of the constants, we need to pass through
+        # the numpy.ndarrays in the computation graph
+        prepared_inputs = self._prepare_inputs_with_constants(
+            *inputs, calibrate=True, quantize_actual_values=False
+        )
+
+        raw_result = self.call_impl(*prepared_inputs, **self.attrs)
+
+        if not isinstance(raw_result, RawOpOutput):
+            # Check if batch normalization is applied per channel
+            scale = self.constant_inputs[self._params_name_to_input_idx["scale"]].values
+            bias = self.constant_inputs[self._params_name_to_input_idx["bias"]].values
+            if scale.size > 1 or bias.size > 1:
+                # Per channel batchnorm struggles with low bit-width quantization.
+                # Batchnorm parameters (scale/bias/mean/var) can vary significantly
+                # between channels. Our tensor-based quantization, however, only supports
+                # a global scale and offset. Errors in quantized values can thus be severe.
+                # To mitigate this, we use percentiles to clip extreme values.
+
+                lower_bound = numpy.percentile(raw_result, 0.1)
+                upper_bound = numpy.percentile(raw_result, 99.9)
+
+                raw_result = numpy.clip(raw_result, lower_bound, upper_bound)
+
+            quantized_samples = QuantizedArray(self.n_bits, raw_result)
+
+            self.output_quant_params = quantized_samples.quantizer.quant_params
+            self.output_quant_stats = quantized_samples.quantizer.quant_stats
+
+            raw_result = quantized_samples.values
+
+        return raw_result
 
 
 class QuantizedFlatten(QuantizedOp):
@@ -1486,8 +2095,9 @@ class QuantizedReduceSum(QuantizedMixingOp):
         # this type difference
         self.keepdims = bool(attrs.get("keepdims", 1))
         self.noop_with_empty_axes = attrs.get("noop_with_empty_axes", 0)
+        self.copy_inputs = False
 
-    def calibrate(self, *inputs: numpy.ndarray) -> numpy.ndarray:
+    def calibrate(self, *inputs: Union[QuantizedArray, numpy.ndarray]) -> numpy.ndarray:
         """Create corresponding QuantizedArray for the output of the activation function.
 
         Args:
@@ -1514,12 +2124,14 @@ class QuantizedReduceSum(QuantizedMixingOp):
     def q_impl(
         self,
         *q_inputs: ONNXOpInputOutputType,
+        calibrate_rounding: bool = False,
         **attrs,
     ) -> ONNXOpInputOutputType:
         """Sum the encrypted tensor's values along the given axes.
 
         Args:
             q_inputs (QuantizedArray): An encrypted integer tensor at index 0.
+            calibrate_rounding (bool): Whether to calibrate rounding or not.
             attrs (Dict): Options are handled in constructor.
 
         Returns:
@@ -1530,30 +2142,65 @@ class QuantizedReduceSum(QuantizedMixingOp):
             *q_inputs, calibrate=False, quantize_actual_values=True
         )
 
-        # Retrieve values and axes parameters
+        assert_true(
+            isinstance(prepared_inputs[0], (QuantizedArray)),
+            "Prepared inputs' values should be found in a QuantizedArray. "
+            f"Got {type(prepared_inputs[0])}",
+        )
+
+        assert_true(
+            isinstance(prepared_inputs[1], numpy.ndarray),
+            "ReduceSum axis parameter should be a Numpy array. " f"Got {type(prepared_inputs[1])}",
+        )
+
+        # Retrieve the quantized values and the axes to sum over
+        # Parameter "axis" Numpy's sum operator has to be a tuple (and not an array)
         q_values = prepared_inputs[0].qvalues
-        axes = prepared_inputs[1]
+        axes = tuple(prepared_inputs[1])
 
-        # Sum all the quantized values
-        q_sum = numpy.sum(q_values, axis=axes, keepdims=self.keepdims)
+        assert_true(
+            0 not in axes,
+            "ReduceSum axis parameter should not contain axis 0 as it is used for batching "
+            f"the inference. Got {axes}",
+        )
 
-        # Determining the number of output zero_points to use for de-quantization with the total
-        # number of elements summed all together, which is the product of all the number of elements
-        # found within the given axes
-        n_elem = numpy.prod([q_values.shape[axis] for axis in axes])
+        with tag(self.op_instance_name):
 
-        # Determining the output scale and zero_point
-        input_quantizer = prepared_inputs[0].quantizer
-        scale = input_quantizer.scale
-        zero_point = n_elem * input_quantizer.zero_point
+            # Need to copy to prevent the following sum to raise precision of the input
+            # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4127
+            @univariate
+            def copy_function(x):
+                return x
 
-        # If this operator is the graph's last operator, there's is no need to created additional
-        # TLUs
-        if self.produces_graph_output:
-            return self.make_output_quant_parameters(q_sum, scale, zero_point)
+            if self.copy_inputs:
+                q_values = copy_function(q_values)
+
+            # Sum all the quantized values
+            q_sum = numpy.sum(q_values, axis=axes, keepdims=self.keepdims)
+
+            # Determining the number of output zero_points to use for de-quantization with
+            # the total number of elements summed all together, which is the product of all
+            # the number of elements found within the given axes
+            n_elem = numpy.prod([q_values.shape[axis] for axis in axes])
+
+            # Determining the output scale and zero_point
+            input_quantizer = prepared_inputs[0].quantizer
+            scale = input_quantizer.scale
+            zero_point = n_elem * input_quantizer.zero_point
+
+            # If this operator is the graph's last operator,
+            # there's is no need to created additional TLUs
+            if self.produces_graph_output:
+                return self.make_output_quant_parameters(q_sum, scale, zero_point)
+
+            f_substract = q_sum - zero_point
+
+        with tag(self.op_instance_name + ".rounding"):
+            # Apply Concrete rounding (if relevant)
+            f_substract = self.cnp_round(f_substract, calibrate_rounding)
 
         # De-quantize the sum
-        f_sum = scale * (q_sum - zero_point)
+        f_sum = scale * f_substract
 
         sum_qarray = QuantizedArray(
             self.n_bits,
@@ -1565,73 +2212,6 @@ class QuantizedReduceSum(QuantizedMixingOp):
         )
 
         return sum_qarray
-
-    def _prepare_inputs_with_constants(
-        self,
-        *inputs: ONNXOpInputOutputType,
-        calibrate: bool,
-        quantize_actual_values: bool,
-    ):
-        """Retrieve all the inputs of an operator in the computational graph.
-
-        This helper method will prepare a list of inputs to an operator. Inputs can be variables,
-        i.e., encrypted tensors, or constants (in the clear). Inputs to an operator are set-up in
-        the slots of a list, as the order of inputs is important.
-
-        Usually the input list is populated with QuantizedArrays. Operators that require the
-        original float (operators that only produce or contribute to TLUs) values will just read
-        out the .values of  these quantized arrays. Operators that do matrix multiplication will
-        read out the quantized integer values of the arrays.  The method can be called during
-        calibration, in which case the variable inputs are just float numpy tensors.
-
-        Args:
-             *inputs (ONNXOpInputOutputType): A list of all variable inputs
-            calibrate (bool): A flag specifying if the method is called during calibration
-            quantize_actual_values (bool): If called by a quantized operator that does matrix
-                multiplication between encrypted and clear values, this method will apply
-                the quantization computation to the input, which will be fused in a (potentially
-                larger) TLU, with preceding floating point computations
-
-        Returns:
-            result (List): a list of inputs which are either QuantizedArray or numpy.arrays. If
-                quantize_actual_values==True then the quantization code is applied
-        """
-        prepared_inputs = super()._prepare_inputs_with_constants(
-            *inputs,
-            calibrate=calibrate,
-            quantize_actual_values=quantize_actual_values,
-        )
-
-        assert_true(
-            isinstance(prepared_inputs[0], (numpy.ndarray, QuantizedArray)),
-            "Prepared inputs's first element should either be a Numpy array of QuantizedArray. "
-            f"Got {type(prepared_inputs[0])}",
-        )
-
-        # Retrieve the input array's shape. The first elements is either an array or a
-        # QuantizedArray depending on if the method is used for calibration or not
-        if isinstance(prepared_inputs[0], numpy.ndarray):
-            shape = prepared_inputs[0].shape
-        elif isinstance(prepared_inputs[0], QuantizedArray):
-            shape = prepared_inputs[0].qvalues.shape
-
-        assert_true(
-            isinstance(prepared_inputs[1], numpy.ndarray) or prepared_inputs[1] is None,
-            "ReduceSum axis parameter should either be a Numpy array or None. "
-            f"Got {type(prepared_inputs[1])}",
-        )
-
-        # Retrieve the axis parameter
-        axes = prepared_inputs[1]
-
-        # As the calibration input-set and inputs are ran over several samples, we need to apply the
-        # sum on all the given axes except the first one (the sample axis), including when axes is
-        # set to None (i.e., sum over all axes).
-        prepared_inputs[1] = (
-            tuple(axes + 1) if axes is not None else tuple(numpy.arange(1, len(shape)))
-        )
-
-        return prepared_inputs
 
 
 class QuantizedErf(QuantizedOp):
@@ -1720,6 +2300,12 @@ class QuantizedBrevitasQuant(QuantizedOp):
         self.is_signed = bool(attrs["signed"])
         self.is_narrow = bool(attrs["narrow"])
 
+        # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4544
+        # Remove this workaround when brevitas export is fixed
+        if self.is_signed is False and self.is_narrow is True:
+            self.is_signed = True
+            self.is_narrow = False
+
         assert_false(
             not self.is_signed and self.is_narrow,
             "Can not use narrow range for non-signed Brevitas quantizers",
@@ -1758,7 +2344,7 @@ class QuantizedBrevitasQuant(QuantizedOp):
         self.output_quant_opts.is_narrow = self.is_narrow
         self.output_quant_opts.is_signed = self.is_signed
 
-    def calibrate(self, *inputs: numpy.ndarray) -> numpy.ndarray:
+    def calibrate(self, *inputs: Union[QuantizedArray, numpy.ndarray]) -> numpy.ndarray:
         """Create corresponding QuantizedArray for the output of Quantization function.
 
         Args:
@@ -2232,3 +2818,212 @@ class ONNXSlice(QuantizedOp):
             bool: False, this operation can not be fused
         """
         return False
+
+
+class QuantizedExpand(QuantizedOp):
+    """Expand operator for quantized tensors."""
+
+    _impl_for_op_named: str = "Expand"
+    quantize_inputs_with_model_outputs_precision = True
+
+    def q_impl(
+        self,
+        *q_inputs: ONNXOpInputOutputType,
+        **attrs,
+    ) -> ONNXOpInputOutputType:
+        """Expand the input tensor to a specified shape.
+
+        Args:
+            q_inputs: an encrypted integer tensor at index 0, shape at index 1
+            attrs: additional optional expand options
+
+        Returns:
+            result (QuantizedArray): expanded encrypted integer tensor
+        """
+
+        prepared_inputs = self._prepare_inputs_with_constants(
+            *q_inputs, calibrate=False, quantize_actual_values=True
+        )
+
+        # Ensure the input is a quantized array
+        assert isinstance(q_inputs[0], QuantizedArray)
+
+        target_shape = prepared_inputs[1]
+
+        # Return a new quantized array with the same quantization parameters
+        return QuantizedArray(
+            q_inputs[0].quantizer.n_bits,
+            self.call_impl(prepared_inputs[0].qvalues, target_shape, **attrs),
+            value_is_float=False,
+            options=self._get_output_quant_opts(),
+            stats=prepared_inputs[0].quantizer.quant_stats,
+            params=prepared_inputs[0].quantizer.quant_params,
+        )
+
+    def can_fuse(self) -> bool:
+        """Determine if this op can be fused.
+
+        Unsqueeze can not be fused since it must be performed over integer tensors as
+        it reshapes an encrypted tensor.
+
+        Returns:
+            bool: False, this operation can not be fused as it operates on encrypted tensors
+        """
+        return False
+
+
+class QuantizedEqual(QuantizedOp):
+    """Comparison operator ==.
+
+    Only supports comparison with a constant.
+    """
+
+    _impl_for_op_named: str = "Equal"
+
+    # Since this op takes a single variable input, we can set int_input_names to a single default id
+    def __init__(
+        self,
+        n_bits_output: int,
+        op_instance_name: str,
+        int_input_names: Set[str] = None,
+        constant_inputs: Optional[Union[Dict[str, Any], Dict[int, Any]]] = None,
+        input_quant_opts: QuantizationOptions = None,
+        **attrs,
+    ) -> None:
+        super().__init__(
+            n_bits_output,
+            op_instance_name,
+            int_input_names,
+            constant_inputs,
+            input_quant_opts,
+            **attrs,
+        )
+
+        # We do not support testing a == b where a,b are encrypted
+        # only comparing to a constant is supported
+        assert_true(constant_inputs is not None and len(constant_inputs) >= 1)
+
+
+class QuantizedUnfold(QuantizedMixingOp):
+    """Quantized Unfold op."""
+
+    _impl_for_op_named: str = "Unfold"
+
+    # Since this op takes a single input, we can set int_input_names to a single default id
+    def __init__(
+        self,
+        n_bits_output: int,
+        op_instance_name: str,
+        int_input_names: Set[str] = None,
+        constant_inputs: Optional[Union[Dict[str, Any], Dict[int, Any]]] = None,
+        input_quant_opts: QuantizationOptions = None,
+        **attrs,
+    ) -> None:
+
+        super().__init__(
+            n_bits_output,
+            op_instance_name,
+            int_input_names,
+            constant_inputs,
+            input_quant_opts,
+            **attrs,
+        )
+
+        # Get the ONNX parameters
+        self.kernel_shape = attrs.get("kernel_shape", None)
+        self.pads = attrs.get("pads", tuple([0] * 2 * (len(self.kernel_shape) - 2)))
+        self.dilations = attrs.get("dilations", tuple([1] * len(self.kernel_shape)))
+        self.strides = attrs.get("strides", tuple([1] * len(self.kernel_shape)))
+
+        # Validate the parameters
+        assert_true(
+            len(self.kernel_shape) == 2,
+            "The Unfold operator currently supports only 2d",
+        )
+        assert_true(
+            len(self.kernel_shape) == len(self.strides),
+            "The Unfold operator requires the number of strides to "
+            "be the same as the number of kernel dimensions",
+        )
+        assert_true(
+            len(self.pads) == 2 * len(self.kernel_shape),
+            "The Unfold operator in Concrete ML requires padding to be specified as "
+            " (pad_left_dim1, pad_right_dim1, pad_left_dim2, pad_right_dim2, ...), following ONNX"
+            " standard",
+        )
+
+        self.kernel: Union[numpy.ndarray, None] = None
+        self.norm_const: Union[float, None] = None
+
+    def q_impl(
+        self,
+        *q_inputs: ONNXOpInputOutputType,
+        **attrs,
+    ) -> ONNXOpInputOutputType:
+
+        # Retrieve the quantized inputs
+        prepared_inputs = self._prepare_inputs_with_constants(
+            *q_inputs, calibrate=False, quantize_actual_values=True
+        )
+        q_input: QuantizedArray = prepared_inputs[0]
+
+        n_in_channels = q_input.qvalues.shape[1]
+        kernels_list = []
+        for _ in range(n_in_channels):
+            for row in range(self.kernel_shape[0]):
+                for col in range(self.kernel_shape[1]):
+                    kernel = numpy.zeros(
+                        (1, 1, self.kernel_shape[0], self.kernel_shape[1]),
+                        dtype=numpy.int64,
+                    )
+                    kernel[:, :, row, col] = 1
+                    kernels_list.append(kernel)
+        kernels = numpy.concatenate(numpy.array(kernels_list), axis=0)
+
+        # for mypy: The Quantized ops can only run on QuantizedArray that have quantization
+        # parameters (i.e., were fully constructed). This should always be the case, except
+        # during the UniformQuantizer initialization when the zero_point can exist as None
+        assert q_input.quantizer.zero_point is not None
+
+        # Compute padding with floor and apply it to the input, pad with the input zero-point
+        pool_pads = compute_onnx_pool_padding(
+            q_input.qvalues.shape, self.kernel_shape, self.pads, self.strides, ceil_mode=0
+        )
+
+        # Can only pad with scalar zero-points, but zero-points can be float in special cases
+        # for output layers
+        _check_op_input_zero_point(q_input.quantizer.zero_point, self.op_instance_name)
+        pad_value = int(q_input.quantizer.zero_point)
+        q_input_pad = numpy_onnx_pad(q_input.qvalues, pool_pads, pad_value, int_only=True)
+
+        # Remark that here, we are _not_ using Concrete pad, since it would pad with
+        # 0's while we want to pad with zero-point's. So, instead, he have done the padding
+        # on our side, with q_input_pad
+        fake_pads = [0] * len(self.pads)
+
+        with tag(self.op_instance_name + ".unfold"):
+            sum_result = fhe_conv(
+                q_input_pad, kernels, None, fake_pads, self.strides, None, None, n_in_channels
+            )
+
+        if self.debug_value_tracker is not None:
+            # pylint: disable-next=unsubscriptable-object
+            self.debug_value_tracker[self.op_instance_name][
+                "output"
+            ] = sum_result  # pragma: no cover
+
+        result = (
+            sum_result.astype(numpy.float64) - q_input.quantizer.zero_point
+        ) * q_input.quantizer.scale
+
+        # Reshape to fit the same shape output as unfold
+        result = result.reshape((result.shape[0], result.shape[1], -1))
+
+        return QuantizedArray(
+            self.n_bits,
+            result,
+            value_is_float=True,
+            options=self._get_output_quant_opts(),
+            stats=self.output_quant_stats,
+            params=self.output_quant_params,
+        )

@@ -1,12 +1,16 @@
 """Utility functions for onnx operator implementations."""
 
-from typing import Tuple, Union
+from typing import Callable, Tuple, Union
 
 import numpy
-from concrete.fhe import conv as cnp_conv
-from concrete.fhe import ones as cnp_ones
+from concrete.fhe import conv as fhe_conv
+from concrete.fhe import ones as fhe_ones
+from concrete.fhe import truncate_bit_pattern
+from concrete.fhe.tracing import Tracer
 
 from ..common.debugging import assert_true
+
+ComparisonOperationType = Callable[[int], bool]
 
 
 def numpy_onnx_pad(
@@ -14,7 +18,7 @@ def numpy_onnx_pad(
     pads: Tuple[int, ...],
     pad_value: Union[float, int, numpy.ndarray] = 0,
     int_only: bool = False,
-) -> numpy.ndarray:
+) -> Union[numpy.ndarray, Tracer]:
     """Pad a tensor according to ONNX spec, using an optional custom pad value.
 
     Args:
@@ -47,11 +51,16 @@ def numpy_onnx_pad(
         # the values on the edges to the input zero_point, which corresponds
         # to the real-axis 0
         if int_only:
-            # Work in integer Concrete mode
-            x_pad = cnp_ones(tuple(padded_shape)) * numpy.int64(pad_value)
+            if isinstance(x_pad, Tracer):
+                # Quantized execution: integer mode with tracing
+                x_pad = fhe_ones(tuple(padded_shape)) * numpy.int64(pad_value)
+            else:
+                # Quantized execution: integer mode without tracing
+                x_pad = numpy.ones(padded_shape, dtype=numpy.int64) * pad_value
         else:
-            # Floating point mode
+            # Calibration mode: floating-point padding for non-quantized execution
             x_pad = numpy.ones(padded_shape, dtype=numpy.float32) * pad_value
+        assert isinstance(x_pad, (numpy.ndarray, Tracer))
 
         # Create the indices for slice assignment, copy all on batch size and channels dimension
         indices = [slice(None), slice(None)] + [
@@ -159,7 +168,7 @@ def onnx_avgpool_compute_norm_const(
     pads: Tuple[int, ...],
     strides: Tuple[int, ...],
     ceil_mode: int,
-) -> Union[numpy.ndarray, float]:
+) -> Union[numpy.ndarray, float, Tracer]:
     """Compute the average pooling normalization constant.
 
     This constant can be a tensor of the same shape as the input or a scalar.
@@ -214,12 +223,40 @@ def onnx_avgpool_compute_norm_const(
         padded_ceil[:, :, 0 : padded_flr.shape[2], 0 : padded_flr.shape[3]] = 1
 
         # Compute the sum of valid indices in each kernel position
-        norm_const = cnp_conv(
+        norm_const = fhe_conv(
             padded_ceil, kernel, None, [0, 0, 0, 0], strides, None, None, n_in_channels
         )
     else:
         # For the PyTorch mode, only positions with all valid indices are used so
         # the averaging is done over the number of cells in the kernel
-        norm_const = numpy.prod(kernel_shape)
+        norm_const = float(numpy.prod(numpy.array(kernel_shape)))
 
     return norm_const
+
+
+def rounded_comparison(
+    x: numpy.ndarray, y: numpy.ndarray, lsbs_to_remove: int, operation: ComparisonOperationType
+) -> Tuple[bool]:
+    """Comparison operation using `round_bit_pattern` function.
+
+    `round_bit_pattern` rounds the bit pattern of an integer to the closer
+    It also checks for any potential overflow. If so, it readjusts the LSBs accordingly.
+
+    The parameter `lsbs_to_remove` in `round_bit_pattern` can either be an integer specifying the
+    number of LSBS to remove, or an `AutoRounder` object that determines the required number of LSBs
+    based on the specified number of MSBs to retain. But in our case, we choose to compute the LSBs
+    manually.
+
+    Args:
+        x (numpy.ndarray): Input tensor
+        y (numpy.ndarray): Input tensor
+        lsbs_to_remove (int): Number of the least significant bits to remove
+        operation (ComparisonOperationType): Comparison operation, which can `<`, `<=` and `==`
+
+    Returns:
+        Tuple[bool]: If x and y satisfy the comparison operator.
+    """
+
+    assert isinstance(lsbs_to_remove, int)
+    rounded_subtraction = truncate_bit_pattern(x - y, lsbs_to_remove=lsbs_to_remove)
+    return (operation(rounded_subtraction),)

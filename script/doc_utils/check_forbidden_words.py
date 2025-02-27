@@ -49,7 +49,7 @@ def process_file(file_str: str, do_open_problematic_files=False):
     file_path = Path(file_str).resolve()
 
     # Don't do it on API or advanced example data files
-    if "docs/developer-guide/api" in file_str or "docs/advanced_examples/data" in file_str:
+    if "docs/references/api" in file_str or "docs/advanced_examples/data" in file_str:
         return True, 0
 
     # Don't do it for conventions.md file that explains what should or not be done
@@ -124,6 +124,7 @@ def process_file(file_str: str, do_open_problematic_files=False):
         ("concrete Numpy", [], []),  # use Concrete
         ("Concrete numpy", [], []),  # use Concrete
         ("Concrete Numpy", [], []),  # use Concrete
+        ("cnp", [], []),  # use fhe (or cp, worst case)
         ("tool-kit", [], []),  # use toolkit
         ("tool-kits", [], []),  # use toolkits
         (
@@ -152,14 +153,18 @@ def process_file(file_str: str, do_open_problematic_files=False):
         ("FHE friendly", [], []),  # use FHE-friendly
         ("slow-down", [], []),  # use slow down
         ("counter-part", [], []),  # use counterpart
-        ("Scikit-learn", [], []),  # use scikit-learn
+        ("Scikit-learn", [], ["README.md"]),  # use scikit-learn
         ("Scikit-Learn", [], []),  # use scikit-learn
         ("scikit-Learn", [], []),  # use scikit-learn
         ("it's", [], []),  # use `it is`
         ("It's", [], []),  # use `It is`
         ("let's", [], []),  # keep a consistent impersonal style
         ("Let's", [], []),  # keep a consistent impersonal style
-        ("let us", ["feel free to let us know"], []),  # keep a consistent impersonal style
+        (
+            "let us",
+            ["feel free to let us know"],
+            ["README.md"],
+        ),  # keep a consistent impersonal style
         ("Let us", [], []),  # keep a consistent impersonal style
         ("github", [], []),  # use GitHub
         ("elementwise", [], []),  # use element-wise
@@ -185,6 +190,8 @@ def process_file(file_str: str, do_open_problematic_files=False):
         ("eg", [], []),  # use e.g.,
         ("eg,", [], []),  # use e.g.,
         ("eg., ", [], []),  # use e.g.,
+        ("Lora", [], []),  # use LoRA
+        ("LORA", [], []),  # use LoRA
     ]
     # For later
     #   "We" or "Our", or more generally, passive form

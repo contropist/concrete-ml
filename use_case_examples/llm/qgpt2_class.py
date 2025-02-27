@@ -2,9 +2,11 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
+from concrete.fhe import GraphProcessor
 from concrete.fhe.compilation import Circuit, Configuration
 from concrete.fhe.tracing import Tracer
 from load_huggingface import get_gpt2_model
+from preprocessor import InsertRounding
 from quant_framework import DualArray, Quantizer
 from transformers.models.gpt2.configuration_gpt2 import GPT2Config
 
@@ -98,7 +100,7 @@ class QuantizedModel:
         q_inputs = self.quantizer.quantize(inputs, key="inputs_quant")
 
         # If the FHE mode is set to disable, we only need to run the quantized operators in the
-        # clear and dequantize
+        # clear and de-quantize
         if fhe == "disable":
             q_y = self.run_numpy(q_inputs)
 
@@ -129,9 +131,7 @@ class QuantizedModel:
                 q_x = np.expand_dims(q_x, axis=0)
 
                 if fhe == "simulate":
-                    # Use new VL with .simulate() once CP's multi-parameter/precision bug is fixed
-                    # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/3856
-                    q_y = self.circuit.graph(q_x, p_error=self.circuit.p_error)
+                    q_y = self.circuit.simulate(q_x)
 
                 elif fhe == "execute":
                     q_y = self.circuit.encrypt_run_decrypt(q_x)
@@ -161,7 +161,12 @@ class QuantizedModel:
         """
         raise NotImplementedError("This method must be implemented by subclasses.")
 
-    def compile(self, configuration: Optional[Configuration] = None) -> Circuit:
+    def compile(
+        self,
+        configuration: Optional[Configuration] = None,
+        msbs_round: Optional[int] = None,
+        rounding_kwargs: Optional[Dict] = None,
+    ) -> Circuit:
         """Compile the model using the stored calibration data.
 
         For now, the model can only be compiled on a batch made of a single input.
@@ -169,6 +174,8 @@ class QuantizedModel:
         Args:
             configuration (Optional[Configuration]): The configuration to use during compilation.
                 Default to None.
+            msbs_round (Optional[int]): msbs to keep after rounding
+            rounding_kwargs (Optional[Dict]): optional keyword arguments of `InsertRounding`
 
         Returns:
             Circuit: The underlying FHE circuit.
@@ -184,8 +191,21 @@ class QuantizedModel:
         # Instantiate the compiler
         compiler = fhe.Compiler(self.run_numpy, {"q_inputs": "encrypted"})
 
+        # Handle rounding
+        if configuration is None:
+            configuration = Configuration()
+        if msbs_round is None:
+            assert rounding_kwargs is None
+        if rounding_kwargs is None:
+            rounding_kwargs = {}
+        rounding_preprocessor = InsertRounding(msbs_round, **rounding_kwargs)
+        assert isinstance(rounding_preprocessor, GraphProcessor)
+        configuration.additional_pre_processors.append(rounding_preprocessor)
+
         # Compile the circuit on the calibration quantized data
-        self.circuit = compiler.compile(inputset, configuration=configuration)
+        self.circuit = compiler.compile(
+            inputset, configuration=configuration, compress_input_ciphertexts=True
+        )
 
         # Print the maximum bit-width reached in the circuit
         print(

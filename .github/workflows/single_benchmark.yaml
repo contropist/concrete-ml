@@ -78,7 +78,6 @@ jobs:
         shell: bash
     env:
       PIP_INDEX_URL: ${{ secrets.PIP_INDEX_URL }}
-      PIP_EXTRA_INDEX_URL: ${{ secrets.PIP_EXTRA_INDEX_URL }}
     steps:
       - name: Instance configuration used
         run: |
@@ -109,7 +108,7 @@ jobs:
 
       # Run with current version
       - name: Checkout CML to run
-        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 1
           lfs: true
@@ -125,7 +124,7 @@ jobs:
       # Install specific version
       # Also pull LFS files (for example, for pulling the pre-trained deep learning model weights)
       - name: Checkout CML to install
-        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 1
           lfs: true
@@ -133,13 +132,13 @@ jobs:
           path: cml_to_install
 
       - name: Set up Python
-        uses: actions/setup-python@65d7f2d534ac1bc67fcd62888c5f4f3d2cb2b236
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b
         with:
           python-version: "3.9"
 
       - name: Install dependencies
         id: install-deps
-        uses: nick-fields/retry@v2
+        uses: nick-fields/retry@7152eba30c6575329ac0576536151aca5a72780e # v3.0.0
         with:
           max_attempts: 5
           timeout_minutes: 20
@@ -155,7 +154,7 @@ jobs:
             # Needed for some reason
             make setup_env
             source ./.venv/bin/activate
-            python -m pip show concrete-numpy
+            python -m pip show concrete-python
 
       # Now we get our most up to date version
       - name: Run the benchmark command
@@ -182,7 +181,7 @@ jobs:
       - name: Upload results
         id: upload-results
         run: |
-          curl \
+          curl --fail-with-body \
           -H "Authorization: Bearer ${{ secrets.NEW_ML_PROGRESS_TRACKER_TOKEN }}" \
           -H "Content-Type: application/json" \
           -d @converted.json \

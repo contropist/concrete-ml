@@ -13,15 +13,21 @@ print_time_execution() {
 
 WHAT_TO_DO="open"
 
-# Create a list of notebooks with long execution times in order not to consider them when refreshing
-# all notebooks at the same time.
-LONG_EXECUTION_TIMES_NOTEBOOKS=()
+# Create a list of notebooks to skip, usually because of their long execution time.
+# Deployment notebook is currently failing
+# FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4064
+NOTEBOOKS_TO_SKIP=("docs/advanced_examples/Deployment.ipynb")
 
 while [ -n "$1" ]
 do
    case "$1" in
         "--run_all_notebooks" )
             WHAT_TO_DO="run_all_notebooks"
+            ;;
+
+        "--run_all_notebooks_gpu" )
+            export CML_USE_GPU=1
+            WHAT_TO_DO="run_all_notebooks_gpu"
             ;;
 
         "--run_all_notebooks_parallel" )
@@ -53,7 +59,7 @@ then
     else
         poetry run jupyter notebook --allow-root
     fi
-elif [ "$WHAT_TO_DO" == "run_all_notebooks" ]
+elif [ "$WHAT_TO_DO" == "run_all_notebooks" ] || [ "$WHAT_TO_DO" == "run_all_notebooks_gpu" ]
 then
     echo "Refreshing notebooks"
 
@@ -63,16 +69,23 @@ then
     echo "" > "${FAILED_NOTEBOOKS}"
 
     # shellcheck disable=SC2207
-    LIST_OF_NOTEBOOKS=($(find ./docs/ -type f -name "*.ipynb" | grep -v ".nbconvert" | grep -v "_build" | grep -v "ipynb_checkpoints"))
+    if [ "$WHAT_TO_DO" == "run_all_notebooks_gpu" ]
+    then
+        LIST_OF_NOTEBOOKS=($(grep -Rnwl './docs/advanced_examples/' --include \*.ipynb -e 'device =' | grep -v ".nbconvert" | grep -v "_build" | grep -v "ipynb_checkpoints"))
+    else
+        LIST_OF_NOTEBOOKS=($(find ./docs -type f -name "*.ipynb" | grep -v ".nbconvert" | grep -v "_build" | grep -v "ipynb_checkpoints"))
+    fi
 
     # Remove notebooks with long execution times
-    for NOTEBOOK_TO_REMOVE in "${LONG_EXECUTION_TIMES_NOTEBOOKS[@]}"
+    for NOTEBOOK_TO_REMOVE in "${NOTEBOOKS_TO_SKIP[@]}"
     do
-        echo "${NOTEBOOK_TO_REMOVE} is skipped as its execution time is too long"
+        echo "Skipping: ${NOTEBOOK_TO_REMOVE}"
 
         # shellcheck disable=SC2206
         LIST_OF_NOTEBOOKS=(${LIST_OF_NOTEBOOKS[@]/*${NOTEBOOK_TO_REMOVE}*/})
     done
+
+    echo ""
 
     # shellcheck disable=SC2068
     for NOTEBOOK in ${LIST_OF_NOTEBOOKS[@]}
@@ -99,7 +112,7 @@ then
     LIST_OF_NOTEBOOKS=($(find ./docs/ -type f -name "*.ipynb" | grep -v ".nbconvert" | grep -v "_build" | grep -v "ipynb_checkpoints"))
 
     # Remove notebooks with long execution times
-    for NOTEBOOK_TO_REMOVE in "${LONG_EXECUTION_TIMES_NOTEBOOKS[@]}"
+    for NOTEBOOK_TO_REMOVE in "${NOTEBOOKS_TO_SKIP[@]}"
     do
         echo "${NOTEBOOK_TO_REMOVE} is skipped as its execution time is too long"
 

@@ -25,7 +25,7 @@ do
             ;;
 
         "--all" )
-            VERSION_LIST="3.8 3.9 3.10"
+            VERSION_LIST="3.8 3.9 3.10 3.11 3.12"
             ;;
 
         "--version" )
@@ -44,7 +44,7 @@ done
 
 if [ "${VERSION_LIST}" == "" ]
 then
-    VERSION_LIST="3.8 3.9 3.10"
+    VERSION_LIST="3.8 3.9 3.10 3.11 3.12"
 fi
 
 for VERSION in $VERSION_LIST
@@ -73,10 +73,9 @@ do
         # Build the wheel file
         poetry build -f wheel
 
-        # Install the dependencies as PyPI would do using the wheel file, inclusing the current
-        # Concrete-Numpy RC version
+        # Install the dependencies as PyPI would do using the wheel file
         PYPI_WHEEL=$(find dist -type f -name "*.whl")
-        python -m pip install "${PYPI_WHEEL}"
+        python -m pip install --extra-index-url https://pypi.zama.ai/cpu "${PYPI_WHEEL}"
 
     elif [ "$METHOD" == "pip" ]
     then
@@ -87,6 +86,7 @@ do
         make sync_env
     elif [ "$METHOD" == "clone" ]
     then
+        deactivate
         rm -rf "${VENV}"
         TMP_DIR=".tmp_dir_clone_${VERSION}"
         rm -rf "${TMP_DIR}"
@@ -98,7 +98,7 @@ do
         cd ../..
         rm -rf "${TMP_DIR}"
     else
-        echo "What is this method $METHOD"
+        echo "Unsupported method: $METHOD"
         exit 255
     fi
 

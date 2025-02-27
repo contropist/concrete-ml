@@ -15,6 +15,29 @@ from concrete.ml.quantization.qat_quantizers import Int8ActPerTensorPoT, Int8Wei
 # pylint: disable=too-many-lines
 
 
+class MultiOutputModel(nn.Module):
+    """Multi-output model."""
+
+    def __init__(
+        self,
+    ) -> None:
+        """Torch Model."""
+        super().__init__()
+        self.value = 3.0
+
+    def forward(self, x, y):
+        """Forward pass.
+
+        Args:
+            x (torch.Tensor): The input of the model.
+            y (torch.Tensor): The input of the model.
+
+        Returns:
+            Tuple[torch.Tensor. torch.Tensor]: Outputs of the network.
+        """
+        return x + y + self.value, (x - y) ** 2
+
+
 class SimpleNet(torch.nn.Module):
     """Fake torch model used to generate some onnx."""
 
@@ -40,11 +63,13 @@ class SimpleNet(torch.nn.Module):
 class FCSmall(nn.Module):
     """Torch model for the tests."""
 
-    def __init__(self, input_output, activation_function):
+    def __init__(self, input_output, activation_function, hidden=None):
         super().__init__()
-        self.fc1 = nn.Linear(in_features=input_output, out_features=input_output)
+
+        hidden_size = input_output if hidden is None else hidden
+        self.fc1 = nn.Linear(in_features=input_output, out_features=hidden_size)
         self.act_f = activation_function()
-        self.fc2 = nn.Linear(in_features=input_output, out_features=input_output)
+        self.fc2 = nn.Linear(in_features=hidden_size, out_features=input_output)
 
     def forward(self, x):
         """Forward pass.
@@ -171,6 +196,7 @@ class CNNOther(nn.Module):
         self.conv1 = nn.Conv2d(input_output, 3, 3, stride=1, padding=1)
         self.pool = nn.AvgPool2d(2, 2)
         self.conv2 = nn.Conv2d(3, 3, 1)
+        self.bn1 = nn.BatchNorm2d(3)
         self.fc1 = nn.Linear(3 * 3 * 3, 5)
         self.fc2 = nn.Linear(5, 3)
         self.fc3 = nn.Linear(3, 2)
@@ -187,6 +213,7 @@ class CNNOther(nn.Module):
         """
         x = self.pool(self.activation_function(self.conv1(x)))
         x = self.activation_function(self.conv2(x))
+        x = self.bn1(x)
         x = x.flatten(1)
         x = self.activation_function(self.fc1(x))
         x = self.activation_function(self.fc2(x))
@@ -825,7 +852,7 @@ class TinyQATCNN(nn.Module):
         return x
 
 
-class SimpleQAT(nn.Module):
+class StepFunctionPTQ(nn.Module):
     """Torch model implements a step function that needs Greater, Cast and Where."""
 
     def __init__(self, input_output, activation_function, n_bits=2, disable_bit_check=False):
@@ -842,9 +869,7 @@ class SimpleQAT(nn.Module):
         n_bits_weights = n_bits
 
         # Generate the pattern 0, 1, ..., 2^N-1, 0, 1, .. 2^N-1, 0, 1..
-        all_weights = numpy.mod(
-            numpy.arange(numpy.prod(self.fc1.weight.shape)), 2**n_bits_weights
-        )
+        all_weights = numpy.mod(numpy.arange(numpy.prod(self.fc1.weight.shape)), 2**n_bits_weights)
 
         # Shuffle the pattern and reshape to weight shape
         numpy.random.shuffle(all_weights)
@@ -1064,26 +1089,7 @@ class TorchSum(nn.Module):
             torch_sum (torch.tensor): The sum of the input's tensor elements along the given axis
         """
         torch_sum = x.sum(dim=self.dim, keepdim=self.keepdim)
-        return torch_sum
 
-
-class TorchSumMod(TorchSum):
-    """Torch model to test the ReduceSum ONNX operator in a circuit containing a PBS."""
-
-    def forward(self, x):
-        """Forward pass.
-
-        Args:
-            x (torch.tensor): The input of the model
-
-        Returns:
-            torch_sum (torch.tensor): The sum of the input's tensor elements along the given axis
-        """
-        torch_sum = x.sum(dim=self.dim, keepdim=self.keepdim)
-
-        # Add an additional operator that requires a TLU in order to force this circuit to
-        # handle a PBS without actually changing the results
-        torch_sum = torch_sum + torch_sum % 2 - torch_sum % 2
         return torch_sum
 
 
@@ -1350,17 +1356,17 @@ class ConcatFancyIndexing(nn.Module):
         super().__init__()
 
         self.n_blocks = n_blocks
-        self.quant_1 = qnn.QuantIdentity(bit_width=n_bits, return_quant_tensor=True)
+        self.quant_1 = qnn.QuantIdentity(bit_width=n_bits, return_quant_tensor=False)
         self.fc1 = qnn.QuantLinear(input_shape, hidden_shape, bias=False, weight_bit_width=n_bits)
 
-        self.quant_concat = qnn.QuantIdentity(bit_width=n_bits, return_quant_tensor=True)
+        self.quant_concat = qnn.QuantIdentity(bit_width=n_bits, return_quant_tensor=False)
 
-        self.quant_2 = qnn.QuantIdentity(bit_width=n_bits, return_quant_tensor=True)
+        self.quant_2 = qnn.QuantIdentity(bit_width=n_bits, return_quant_tensor=False)
         self.fc2 = qnn.QuantLinear(
             hidden_shape * self.n_blocks, hidden_shape, bias=True, weight_bit_width=n_bits
         )
 
-        self.quant_3 = qnn.QuantIdentity(bit_width=n_bits, return_quant_tensor=True)
+        self.quant_3 = qnn.QuantIdentity(bit_width=n_bits, return_quant_tensor=False)
         self.fc4 = qnn.QuantLinear(hidden_shape, output_shape, bias=True, weight_bit_width=n_bits)
 
     def forward(self, x):
@@ -1375,9 +1381,9 @@ class ConcatFancyIndexing(nn.Module):
         x_pre = []
 
         for i in range(self.n_blocks):
-            x_block = x[:, i, :]
-            q1_out = self.quant_1(x_block)
-            fc1_out = self.fc1(q1_out)
+            q_x = self.quant_1(x)
+            q_x_block = q_x[:, i, :]
+            fc1_out = self.fc1(q_x_block)
             q_concat_out = self.quant_concat(fc1_out)
 
             x_pre.append(q_concat_out)
@@ -1409,3 +1415,292 @@ class PartialQATModel(torch.nn.Module):
         """
 
         return self.sub_module(x)
+
+
+class EncryptedMatrixMultiplicationModel(nn.Module):
+    """PyTorch module for performing matrix multiplication between two encrypted values."""
+
+    # pylint: disable-next=unused-argument
+    def __init__(self, input_output, activation_function):
+        super().__init__()
+        self.act = activation_function()
+
+    def forward(self, input1):
+        """Forward function for matrix multiplication.
+
+        Args:
+            input1 (torch.Tensor): The first input tensor.
+
+        Returns:
+            torch.Tensor: The result of the matrix multiplication.
+        """
+        input1 = input1.unsqueeze(1)
+
+        output = torch.matmul(input1, input1.transpose(2, 1))
+        output = self.act(output)
+
+        # Squeeze out one of the last two singleton dimensions
+        output = output.squeeze(-1)
+        return output
+
+
+class ManualLogisticRegressionTraining(torch.nn.Module):
+    """PyTorch module for performing SGD training."""
+
+    def __init__(self, learning_rate=0.1):
+        super().__init__()
+        self.learning_rate = learning_rate
+
+    def forward(self, x, y, weights, bias):
+        """Forward function for matrix multiplication.
+
+        Args:
+            x (torch.Tensor): The training data tensor.
+            y (torch.Tensor): The target tensor.
+            weights (torch.Tensor): The weights to be learned.
+            bias (torch.Tensor): The bias to be learned.
+
+        Returns:
+            torch.Tensor: The updated weights after performing a training step.
+        """
+        z = torch.bmm(x, weights) + bias
+        output = torch.sigmoid(z)
+
+        difference_z = output - y
+        dweights = torch.bmm(x.transpose(1, 2), difference_z) / x.size(1)
+
+        weights = weights - self.learning_rate * dweights
+
+        return weights
+
+    @staticmethod
+    def predict(x, weights, bias):
+        """Predicts based on weights and bias as inputs.
+
+        Args:
+            x (torch.Tensor): Input data tensor.
+            weights (torch.Tensor): Weights tensor.
+            bias (torch.Tensor): Bias tensor.
+
+        Returns:
+            torch.Tensor: The predicted outputs for the given inputs.
+        """
+        with torch.no_grad():
+            batch_size = x.shape[0]
+
+            # Expand weights and bias dimensions to match the batch size of X
+            weights_expanded = weights.expand(batch_size, -1, -1)
+            bias_expanded = bias.expand(batch_size, -1, -1)
+
+            outputs = torch.sigmoid(torch.bmm(x, weights_expanded) + bias_expanded)
+        return outputs.squeeze()
+
+
+class WhereNet(torch.nn.Module):
+    """Simple network with a where operation for testing."""
+
+    def __init__(self, n_hidden):
+        super().__init__()
+        self.n_hidden = n_hidden
+        self.fc_tot = torch.rand(1, n_hidden) > 0.5
+
+    def forward(self, x):
+        """Forward pass.
+
+        Args:
+            x (torch.Tensor): The input tensor.
+
+        Returns:
+            torch.Tensor: The output tensor after applying the where operation.
+        """
+        y = torch.where(self.fc_tot, x, 0.0)
+        return y
+
+
+class AddNet(nn.Module):
+    """Torch model that performs a simple addition between two inputs."""
+
+    def __init__(self, use_conv, use_qat, input_output, n_bits):  # pylint: disable=unused-argument
+        super().__init__()
+        # No initialization needed for simple addition
+
+    @staticmethod
+    def forward(x, y):
+        """Forward pass.
+
+        Args:
+            x: First input tensor.
+            y: Second input tensor.
+
+        Returns:
+            Result of adding x and y.
+        """
+        return x + y
+
+
+class ExpandModel(nn.Module):
+    """Minimalist network that expands the input tensor to a larger size."""
+
+    def __init__(self, is_qat):  # pylint: disable=unused-argument
+        super().__init__()
+        self.is_qat = is_qat
+        if is_qat:
+            self.input_quant = qnn.QuantIdentity(bit_width=8)
+
+    def forward(self, x):
+        """Expand the input tensor to the target size.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            torch.Tensor: Expanded tensor.
+        """
+        if self.is_qat:
+            x = self.input_quant(x)
+        x = x.reshape(x.shape + (1,))
+        return x.expand(x.shape[:-1] + (4,))
+
+
+class Conv1dModel(nn.Module):
+    """Small model that uses a 1D convolution operator."""
+
+    def __init__(self, input_output, activation_function) -> None:
+        super().__init__()
+
+        self.conv1 = nn.Conv1d(input_output, 2, 2, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm1d(2)
+        self.act = activation_function()
+        self.fc1 = nn.Linear(input_output, 3)
+
+    def forward(self, x):
+        """Forward pass.
+
+        Args:
+            x (torch.Tensor): The model's input.
+
+        Returns:
+            torch.Tensor: The model's output.
+
+        """
+        x = self.act(self.conv1(x))
+        x = self.bn1(x)
+        x = self.fc1(x)
+        return x
+
+
+class IdentityExpandModel(nn.Module):
+    """Model that only adds an empty dimension at axis 0.
+
+    This model is mostly useful for testing the composition feature.
+    """
+
+    def forward(self, x):
+        """Forward pass.
+
+        Args:
+            x (torch.Tensor): The input of the model.
+
+        Returns:
+            Tuple[torch.Tensor. torch.Tensor]: Outputs of the network.
+        """
+        return x.unsqueeze(0)
+
+
+class IdentityExpandMultiOutputModel(nn.Module):
+    """Model that only adds an empty dimension at axis 0, and returns the initial input as well.
+
+    This model is mostly useful for testing the composition feature.
+    """
+
+    def forward(self, x):
+        """Forward pass.
+
+        Args:
+            x (torch.Tensor): The input of the model.
+
+        Returns:
+            Tuple[torch.Tensor. torch.Tensor]: Outputs of the network.
+        """
+        return x, x.unsqueeze(0)
+
+
+class TorchDivide(torch.nn.Module):
+    """Torch model that performs a encrypted division between two inputs."""
+
+    def __init__(self, input_output, activation_function):  # pylint: disable=unused-argument
+        super().__init__()
+
+    @staticmethod
+    def forward(x, y):
+        """Forward pass.
+
+        Args:
+            x (torch.Tensor): The first input tensor.
+            y (torch.Tensor): The second input tensor.
+
+        Returns:
+            torch.Tensor: The result of the division.
+        """
+        return x / y
+
+
+class TorchMultiply(torch.nn.Module):
+    """Torch model that performs a encrypted multiplication between two inputs."""
+
+    def __init__(self, input_output, activation_function):  # pylint: disable=unused-argument
+        super().__init__()
+
+    @staticmethod
+    def forward(x, y):
+        """Forward pass.
+
+        Args:
+            x (torch.Tensor): The first input tensor.
+            y (torch.Tensor): The second input tensor.
+
+        Returns:
+            torch.Tensor: The result of the multiplication.
+        """
+        return x * y
+
+
+class EmbeddingModel(nn.Module):
+    """A torch model with an embedding layer."""
+
+    def __init__(self, num_embeddings, embedding_dim, activation_function=nn.ReLU):
+        super().__init__()
+        self.embedding = nn.Embedding(num_embeddings, embedding_dim)
+        self.linear = nn.Linear(embedding_dim, embedding_dim)
+        self.relu = activation_function()
+
+    def forward(self, x):
+        """Forward pass.
+
+        Args:
+            x (torch.Tensor): The input tensor containing indices.
+
+        Returns:
+            torch.Tensor: The output tensor after embedding.
+        """
+        x = self.embedding(x)
+        x = self.linear(x)
+        x = self.relu(x)
+        x = self.linear(x)
+        return x
+
+
+class AllZeroCNN(CNNOther):
+    """A CNN class that has all zero weights and biases."""
+
+    def __init__(self, input_output, activation_function):
+        super().__init__(input_output, activation_function)
+
+        for module in self.modules():
+            # assert m.bias is not None
+            # Disable mypy as it properly detects that module's bias term is None end therefore
+            # does not have a `data` attribute but fails to take into consideration the fact
+            # that `torch.nn.init.constant_` actually handles such a case
+            if isinstance(module, (nn.Conv2d, nn.Linear)):
+                torch.nn.init.constant_(module.weight.data, 0)
+                torch.nn.init.constant_(module.bias.data, 0)  # type: ignore[union-attr]

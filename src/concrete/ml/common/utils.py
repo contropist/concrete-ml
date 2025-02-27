@@ -1,6 +1,7 @@
 """Utils that can be re-used by other pieces of code in the module."""
 
 import enum
+import os
 import string
 from functools import partial
 from types import FunctionType
@@ -9,6 +10,8 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Union
 import numpy
 import onnx
 import torch
+from concrete.compiler import check_gpu_available, check_gpu_enabled
+from concrete.fhe import Exactness
 from concrete.fhe.dtypes import Integer
 from sklearn.base import is_classifier, is_regressor
 
@@ -16,7 +19,6 @@ from ..common.check_inputs import check_array_and_assert
 from ..common.debugging import assert_true
 
 _VALID_ARG_CHARS = set(string.ascii_letters).union(str(i) for i in range(10)).union(("_",))
-
 
 SUPPORTED_FLOAT_TYPES = {
     "float64": torch.float64,
@@ -32,13 +34,13 @@ SUPPORTED_INT_TYPES = {
 
 SUPPORTED_TYPES = {**SUPPORTED_FLOAT_TYPES, **SUPPORTED_INT_TYPES}
 
+SUPPORTED_DEVICES = ["cuda", "cpu"]
+
 MAX_BITWIDTH_BACKWARD_COMPATIBLE = 8
 
 # Indicate if the old virtual library method should be used instead of the compiler simulation
 # when simulating FHE executions
-# Set 'USE_OLD_VL' to False by default once the new simulation is fixed
-# FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4091
-USE_OLD_VL = True
+USE_OLD_VL = False
 
 # Debug option for testing round PBS optimization
 # Setting this option to true will make quantizers "round half up"
@@ -47,6 +49,16 @@ USE_OLD_VL = True
 # which has the same behavior as torch.round -> Brevitas nets
 # should be exact compared to their Concrete ML QuantizedModule
 QUANT_ROUND_LIKE_ROUND_PBS = False
+
+# Enable input ciphertext compression
+# Note: This setting is fixed and cannot be altered by users
+# However, for internal testing purposes, we retain the capability to disable this feature
+os.environ["USE_INPUT_COMPRESSION"] = os.environ.get("USE_INPUT_COMPRESSION", "1")
+
+# Enable PBS evaluation key compression (~4x size reduction)
+# Note: This setting is fixed and cannot be altered by users
+# However, for internal testing purposes, we retain the capability to disable this feature
+os.environ["USE_KEY_COMPRESSION"] = os.environ.get("USE_KEY_COMPRESSION", "1")
 
 
 class FheMode(str, enum.Enum):
@@ -90,6 +102,36 @@ class FheMode(str, enum.Enum):
             bool: Whether the FHE mode is supported or not.
         """
         return fhe in FheMode.__members__.values()
+
+
+class CiphertextFormat(str, enum.Enum):
+    """Type of ciphertext used as input/output for a model."""
+
+    CONCRETE = "concrete"
+    TFHE_RS = "tfhe-rs"
+
+    @staticmethod
+    def is_valid(ct_format: Union["CiphertextFormat", str]) -> bool:
+        """Indicate if the given name is a supported FHE ciphertext format.
+
+        Args:
+            ct_format (Union[CiphertextFormat, str]): The ciphertext format to check.
+
+        Returns:
+            bool: Whether the ciphertext format is valid.
+        """
+        return ct_format in CiphertextFormat.__members__.values()
+
+
+class HybridFHEMode(enum.Enum):
+    """Simple enum for different modes of execution of HybridModel."""
+
+    DISABLE = "disable"  # Use torch weights
+    REMOTE = "remote"  # Use remote FHE server
+    SIMULATE = "simulate"  # Use FHE simulation
+    CALIBRATE = "calibrate"  # Use calibration (to run before FHE compilation)
+    EXECUTE = "execute"  # Use FHE execution
+    TORCH = "torch"  # Use torch layers
 
 
 def replace_invalid_arg_name_chars(arg_name: str) -> str:
@@ -557,12 +599,15 @@ def all_values_are_floats(*values: Any) -> bool:
     return all(_is_of_dtype(value, SUPPORTED_FLOAT_TYPES) for value in values)
 
 
-def all_values_are_of_dtype(*values: Any, dtypes: Union[str, List[str]]) -> bool:
+def all_values_are_of_dtype(
+    *values: Any, dtypes: Union[str, List[str]], allow_none: bool = False
+) -> bool:
     """Indicate if all unpacked values are of the specified dtype(s).
 
     Args:
         *values (Any): The values to consider.
         dtypes (Union[str, List[str]]): The dtype(s) to consider.
+        allow_none (bool): Indicate if the values can be None.
 
     Returns:
         bool: Whether all values are of the specified dtype(s) or not.
@@ -581,6 +626,12 @@ def all_values_are_of_dtype(*values: Any, dtypes: Union[str, List[str]]) -> bool
         )
 
         supported_dtypes[dtype] = supported_dtype
+
+    # If the values can be None, only check the other values
+    if allow_none:
+        return all(
+            _is_of_dtype(value, supported_dtypes) if value is not None else True for value in values
+        )
 
     return all(_is_of_dtype(value, supported_dtypes) for value in values)
 
@@ -607,3 +658,149 @@ def array_allclose_and_same_shape(
     assert isinstance(b, numpy.ndarray)
 
     return a.shape == b.shape and numpy.allclose(a, b, rtol, atol, equal_nan)
+
+
+def process_rounding_threshold_bits(rounding_threshold_bits):
+    """Check and process the rounding_threshold_bits parameter.
+
+    Args:
+        rounding_threshold_bits (Union[None, int, Dict[str, Union[str, int]]]): Defines precision
+            rounding for model accumulators. Accepts None, an int, or a dict.
+            The dict can specify 'method' (fhe.Exactness.EXACT or fhe.Exactness.APPROXIMATE)
+            and 'n_bits' ('auto' or int)
+
+    Returns:
+        Dict[str, Union[str, int]]: Processed rounding_threshold_bits dictionary.
+
+    Raises:
+        NotImplementedError: If 'auto' rounding is specified but not implemented.
+        ValueError: If an invalid type or value is provided for rounding_threshold_bits.
+        KeyError: If the dict contains keys other than 'n_bits' and 'method'.
+    """
+    n_bits_rounding: Union[None, str, int] = None
+    method: Exactness = Exactness.EXACT
+
+    # Only process if rounding_threshold_bits is not None
+    if rounding_threshold_bits is not None:
+        if isinstance(rounding_threshold_bits, int):
+            n_bits_rounding = rounding_threshold_bits
+        elif isinstance(rounding_threshold_bits, dict):
+            valid_keys = {"n_bits", "method"}
+            if not valid_keys.issuperset(rounding_threshold_bits.keys()):
+                raise KeyError(
+                    f"Invalid keys in rounding_threshold_bits. "
+                    f"Allowed keys are {sorted(valid_keys)}."
+                )
+            n_bits_rounding = rounding_threshold_bits.get("n_bits")
+            if n_bits_rounding == "auto":
+                raise NotImplementedError("Automatic rounding is not implemented yet.")
+            if not isinstance(n_bits_rounding, int):
+                raise ValueError("n_bits must be an integer.")
+            method = rounding_threshold_bits.get("method", method)
+            if not isinstance(method, Exactness):
+                method_str = method.upper()
+                if method_str in ["EXACT", "APPROXIMATE"]:
+                    method = Exactness[method_str]
+                else:
+                    raise ValueError(
+                        f"{method_str} is not a valid method. Must be one of EXACT, APPROXIMATE."
+                    )
+        else:
+            raise ValueError("Invalid type for rounding_threshold_bits. Must be int or dict.")
+
+        if n_bits_rounding is not None and not 2 <= n_bits_rounding <= 8:
+            raise ValueError("n_bits_rounding must be between 2 and 8 inclusive.")
+
+        rounding_threshold_bits = {"n_bits": n_bits_rounding, "method": method}
+
+    return rounding_threshold_bits
+
+
+def check_device_is_valid(device: str) -> str:
+    """Check whether the device string is valid or raise an exception.
+
+    Args:
+        device (str): the device string. Valid values are 'cpu', 'cuda'
+
+    Returns:
+        str: the valid device string
+
+    Raises:
+        ValueError: if the device string is incorrect
+    """
+
+    str_devices = "[" + ",".join(map(lambda s: "'" + s + "'", SUPPORTED_DEVICES)) + "]"
+
+    if device not in SUPPORTED_DEVICES:
+        raise ValueError(
+            f"Model compilation targets given through the `device` "
+            f"argument can be one of {str_devices}"
+        )
+
+    return device
+
+
+def check_compilation_device_is_valid_and_is_cuda(device: str) -> bool:
+    """Check whether the device string for compilation or FHE execution is CUDA or CPU.
+
+    Args:
+        device (str): the device string. Valid values are 'cpu', 'cuda'
+
+    Returns:
+        bool: whether GPU should be enabled for compilation
+
+    Raises:
+        ValueError: if the device string is incorrect or if CUDA is not supported
+    """
+
+    # Only parse device ids for FHE execution
+    device = check_device_is_valid(device)
+
+    # Allow forcing device to GPU for tests
+    if os.environ.get("CML_USE_GPU", False) == "1" and not device == "cuda":  # pragma: no cover
+        if not check_gpu_enabled():
+            raise ValueError(
+                "CUDA FHE execution was requested with CML_USE_GPU but the Concrete runtime "
+                "that is installed on this system does not support CUDA. Please"
+                "install a GPU-enabled Concrete-Python package."
+            )
+
+        print(f"Compilation device override, was '{device}' -> change to 'cuda'")
+        device = "cuda"
+
+    # All other devices are considered cpu for now
+    is_cuda = device == "cuda"
+
+    if is_cuda:
+        if not check_gpu_enabled():
+            raise ValueError(
+                "CUDA FHE execution was requested but the Concrete runtime "
+                "that is installed on this system does not support CUDA. Please"
+                "install a GPU-enabled Concrete-Python package."
+            )
+
+        return True  # pragma: no cover
+
+    return False
+
+
+def check_execution_device_is_valid_and_is_cuda(
+    is_compiled_for_cuda: bool,
+    fhe: Union[FheMode, str],
+) -> None:
+    """Check whether the circuit can be executed on the required device.
+
+    Args:
+        is_compiled_for_cuda (bool): whether the circuit is compiled for CUDA
+        fhe (Union[FheMode, str]): the execution mode of the circuit
+
+    Raises:
+        ValueError: if the requested device is not available
+    """
+
+    if fhe == FheMode.EXECUTE and is_compiled_for_cuda:
+        if not check_gpu_available():
+            raise ValueError(
+                "CUDA FHE execution was requested but no compatible CUDA "
+                "enabled device could be found"
+            )

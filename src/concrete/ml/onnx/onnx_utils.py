@@ -1,4 +1,5 @@
 """Utils to interpret an ONNX model with numpy."""
+
 # Utils to interpret an ONNX model with numpy.
 
 
@@ -211,15 +212,17 @@
 # - mypy typing hints
 # - existing and new ops implementation in separate file
 
+import tempfile
+from pathlib import Path
+
 # Original file:
 # https://github.com/google/jax/blob/f6d329b2d9b5f83c6a59e5739aa1ca8d4d1ffa1c/examples/onnx2xla.py
-
-
-from typing import Any, Callable, Dict, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy
 import onnx
 from onnx import numpy_helper
+from onnx.external_data_helper import convert_model_to_external_data
 
 from .ops_impl import (
     numpy_abs,
@@ -245,8 +248,10 @@ from .ops_impl import (
     numpy_div,
     numpy_elu,
     numpy_equal,
+    numpy_equal_float,
     numpy_erf,
     numpy_exp,
+    numpy_expand,
     numpy_flatten,
     numpy_floor,
     numpy_gather,
@@ -272,6 +277,7 @@ from .ops_impl import (
     numpy_neg,
     numpy_not,
     numpy_not_float,
+    numpy_onehot,
     numpy_or,
     numpy_or_float,
     numpy_pad,
@@ -295,8 +301,12 @@ from .ops_impl import (
     numpy_tanh,
     numpy_thresholdedrelu,
     numpy_transpose,
+    numpy_unfold,
     numpy_unsqueeze,
     numpy_where,
+    rounded_numpy_equal_for_trees,
+    rounded_numpy_less_for_trees,
+    rounded_numpy_less_or_equal_for_trees,
 )
 
 ATTR_TYPES = dict(onnx.AttributeProto.AttributeType.items())
@@ -316,69 +326,71 @@ ATTR_GETTERS = {
 # We are using OPSET_VERSION_FOR_ONNX_EXPORT for ONNX export, implement the relevant revisions of
 # the operators
 ONNX_OPS_TO_NUMPY_IMPL: Dict[str, Callable[..., Tuple[numpy.ndarray, ...]]] = {
-    "Add": numpy_add,
-    "Clip": numpy_clip,
-    "Constant": numpy_constant,
-    "Cos": numpy_cos,
-    "Cosh": numpy_cosh,
+    "Abs": numpy_abs,
     "Acos": numpy_acos,
     "Acosh": numpy_acosh,
-    "MatMul": numpy_matmul,
-    "Gemm": numpy_gemm,
-    "Relu": numpy_relu,
-    "Selu": numpy_selu,
-    "Elu": numpy_elu,
-    "Erf": numpy_erf,
-    "ThresholdedRelu": numpy_thresholdedrelu,
-    "LeakyRelu": numpy_leakyrelu,
-    "Celu": numpy_celu,
-    "Sin": numpy_sin,
-    "Sinh": numpy_sinh,
+    "Add": numpy_add,
     "Asin": numpy_asin,
     "Asinh": numpy_asinh,
-    "Sigmoid": numpy_sigmoid,
-    "HardSigmoid": numpy_hardsigmoid,
-    "Tan": numpy_tan,
-    "Tanh": numpy_tanh,
     "Atan": numpy_atan,
     "Atanh": numpy_atanh,
-    "Softplus": numpy_softplus,
-    "Abs": numpy_abs,
-    "Div": numpy_div,
-    "Mul": numpy_mul,
-    "Sub": numpy_sub,
-    "Log": numpy_log,
-    "Exp": numpy_exp,
-    "Equal": numpy_equal,
-    "Identity": numpy_identity,
-    "Reshape": numpy_reshape,
-    "Transpose": numpy_transpose,
-    "Conv": numpy_conv,
-    "PRelu": numpy_prelu,
-    "HardSwish": numpy_hardswish,
     "AveragePool": numpy_avgpool,
-    "MaxPool": numpy_maxpool,
-    "Pad": numpy_pad,
-    "Where": numpy_where,
-    "Cast": numpy_cast,
     "BatchNormalization": numpy_batchnorm,
+    "Cast": numpy_cast,
+    "Celu": numpy_celu,
+    "Clip": numpy_clip,
+    "Concat": numpy_concatenate,
+    "Constant": numpy_constant,
+    "ConstantOfShape": numpy_constant_of_shape,
+    "Conv": numpy_conv,
+    "Cos": numpy_cos,
+    "Cosh": numpy_cosh,
+    "Div": numpy_div,
+    "Elu": numpy_elu,
+    "OneHot": numpy_onehot,
+    "Erf": numpy_erf,
+    "Expand": numpy_expand,
+    "Exp": numpy_exp,
     "Flatten": numpy_flatten,
-    "Round": numpy_round,
+    "Floor": numpy_floor,
+    "Gather": numpy_gather,
+    "Gemm": numpy_gemm,
+    "HardSigmoid": numpy_hardsigmoid,
+    "HardSwish": numpy_hardswish,
+    "Identity": numpy_identity,
+    "LeakyRelu": numpy_leakyrelu,
+    "Log": numpy_log,
+    "MatMul": numpy_matmul,
+    "Max": numpy_max,
+    "MaxPool": numpy_maxpool,
+    "Min": numpy_min,
+    "Mul": numpy_mul,
+    "Neg": numpy_neg,
+    "Pad": numpy_pad,
+    "PRelu": numpy_prelu,
     "Pow": numpy_pow,
     "ReduceSum": numpy_reduce_sum,
-    "onnx.brevitas.Quant": numpy_brevitas_quant,
-    "Floor": numpy_floor,
-    "Max": numpy_max,
-    "Min": numpy_min,
-    "Neg": numpy_neg,
-    "Sign": numpy_sign,
-    "Concat": numpy_concatenate,
-    "Unsqueeze": numpy_unsqueeze,
-    "Squeeze": numpy_squeeze,
-    "Slice": numpy_slice,
-    "Gather": numpy_gather,
+    "Relu": numpy_relu,
+    "Reshape": numpy_reshape,
+    "Round": numpy_round,
+    "Selu": numpy_selu,
     "Shape": numpy_shape,
-    "ConstantOfShape": numpy_constant_of_shape,
+    "Sigmoid": numpy_sigmoid,
+    "Sign": numpy_sign,
+    "Sin": numpy_sin,
+    "Sinh": numpy_sinh,
+    "Slice": numpy_slice,
+    "Softplus": numpy_softplus,
+    "Squeeze": numpy_squeeze,
+    "Sub": numpy_sub,
+    "Tan": numpy_tan,
+    "Tanh": numpy_tanh,
+    "ThresholdedRelu": numpy_thresholdedrelu,
+    "Transpose": numpy_transpose,
+    "Unfold": numpy_unfold,
+    "Unsqueeze": numpy_unsqueeze,
+    "Where": numpy_where,
+    "onnx.brevitas.Quant": numpy_brevitas_quant,
 }
 
 
@@ -389,22 +401,32 @@ ONNX_OPS_TO_NUMPY_IMPL: Dict[str, Callable[..., Tuple[numpy.ndarray, ...]]] = {
 
 # Comparison operators needed for QuantizedOps as they cast the boolean outputs into floats.
 ONNX_COMPARISON_OPS_TO_NUMPY_IMPL_FLOAT: Dict[str, Callable[..., Tuple[numpy.ndarray, ...]]] = {
-    "Or": numpy_or_float,
-    "Not": numpy_not_float,
+    "Equal": numpy_equal_float,
     "Greater": numpy_greater_float,
     "GreaterOrEqual": numpy_greater_or_equal_float,
     "Less": numpy_less_float,
     "LessOrEqual": numpy_less_or_equal_float,
+    "Not": numpy_not_float,
+    "Or": numpy_or_float,
 }
+
 
 # Comparison operators used in tree-based models as they keep the outputs' boolean dtype.
 ONNX_COMPARISON_OPS_TO_NUMPY_IMPL_BOOL: Dict[str, Callable[..., Tuple[numpy.ndarray, ...]]] = {
-    "Or": numpy_or,
-    "Not": numpy_not,
+    "Equal": numpy_equal,
     "Greater": numpy_greater,
     "GreaterOrEqual": numpy_greater_or_equal,
     "Less": numpy_less,
     "LessOrEqual": numpy_less_or_equal,
+    "Not": numpy_not,
+    "Or": numpy_or,
+}
+
+# All numpy operators used for tree-based models that support auto rounding
+ONNX_COMPARISON_OPS_TO_ROUNDED_TREES_NUMPY_IMPL_BOOL = {
+    "Equal": rounded_numpy_equal_for_trees,
+    "Less": rounded_numpy_less_for_trees,
+    "LessOrEqual": rounded_numpy_less_or_equal_for_trees,
 }
 
 # All numpy operators used in QuantizedOps
@@ -412,7 +434,6 @@ ONNX_OPS_TO_NUMPY_IMPL.update(ONNX_COMPARISON_OPS_TO_NUMPY_IMPL_FLOAT)
 
 # All numpy operators used for tree-based models
 ONNX_OPS_TO_NUMPY_IMPL_BOOL = {**ONNX_OPS_TO_NUMPY_IMPL, **ONNX_COMPARISON_OPS_TO_NUMPY_IMPL_BOOL}
-
 
 IMPLEMENTED_ONNX_OPS = set(ONNX_OPS_TO_NUMPY_IMPL.keys())
 
@@ -465,6 +486,63 @@ def execute_onnx_with_numpy(
         curr_inputs = (node_results[input_name] for input_name in node.input)
         attributes = {attribute.name: get_attribute(attribute) for attribute in node.attribute}
         outputs = ONNX_OPS_TO_NUMPY_IMPL_BOOL[node.op_type](*curr_inputs, **attributes)
+        node_results.update(zip(node.output, outputs))
+
+    return tuple(node_results[output.name] for output in graph.output)
+
+
+def execute_onnx_with_numpy_trees(
+    graph: onnx.GraphProto,
+    lsbs_to_remove_for_trees: Optional[Tuple[int, int]],
+    *inputs: numpy.ndarray,
+) -> Tuple[numpy.ndarray, ...]:
+    """Execute the provided ONNX graph on the given inputs for tree-based models only.
+
+    Args:
+        graph (onnx.GraphProto): The ONNX graph to execute.
+        lsbs_to_remove_for_trees (Optional[Tuple[int, int]]): This parameter is exclusively used for
+            optimizing tree-based models. It contains the values of the least significant bits to
+            remove during the tree traversal, where the first value refers to the first comparison
+            (either "less" or "less_or_equal"), while the second value refers to the "Equal"
+            comparison operation.
+            Default to None.
+        *inputs: The inputs of the graph.
+
+    Returns:
+        Tuple[numpy.ndarray]: The result of the graph's execution.
+    """
+
+    op_type: Callable[..., Tuple[numpy.ndarray[Any, Any], ...]]
+
+    # If no tree-based optimization is specified, return standard execution
+    if lsbs_to_remove_for_trees is None:
+        return execute_onnx_with_numpy(graph, *inputs)
+
+    node_results: Dict[str, numpy.ndarray] = dict(
+        {graph_input.name: input_value for graph_input, input_value in zip(graph.input, inputs)},
+        **{
+            initializer.name: numpy_helper.to_array(initializer)
+            for initializer in graph.initializer
+        },
+    )
+
+    for node in graph.node:
+        curr_inputs = (node_results[input_name] for input_name in node.input)
+        attributes = {attribute.name: get_attribute(attribute) for attribute in node.attribute}
+
+        if node.op_type in ONNX_COMPARISON_OPS_TO_ROUNDED_TREES_NUMPY_IMPL_BOOL:
+
+            # The first LSB refers to `Less` or `LessOrEqual` comparisons
+            # The second LSB refers to `Equal` comparison
+            stage = 0 if node.op_type != "Equal" else 1
+            attributes["lsbs_to_remove_for_trees"] = lsbs_to_remove_for_trees[stage]
+
+            # Use rounded numpy operation to relevant comparison nodes
+            op_type = ONNX_COMPARISON_OPS_TO_ROUNDED_TREES_NUMPY_IMPL_BOOL[node.op_type]
+        else:
+            op_type = ONNX_OPS_TO_NUMPY_IMPL_BOOL[node.op_type]
+
+        outputs = op_type(*curr_inputs, **attributes)
 
         node_results.update(zip(node.output, outputs))
     return tuple(node_results[output.name] for output in graph.output)
@@ -495,3 +573,52 @@ def remove_initializer_from_input(model: onnx.ModelProto):  # pragma: no cover
             inputs.remove(name_to_input[initializer.name])
 
     return model
+
+
+def check_onnx_model(onnx_model: onnx.ModelProto) -> None:
+    """Check an ONNX model, handling large models (>2GB) by using external data.
+
+    Args:
+        onnx_model (onnx.ModelProto): The ONNX model to check.
+
+    Raises:
+        ValueError: If the model is too large (>2GB) or if there's another ValueError.
+    """
+    # Create a copy of the input model
+    onnx_model_copy = onnx.ModelProto()
+    onnx_model_copy.CopyFrom(onnx_model)
+
+    try:
+        # Try to check the model copy directly
+        onnx.checker.check_model(onnx_model_copy)
+    # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4604
+    except ValueError as e:  # pragma: no cover
+        error_message = str(e)
+        if (
+            "Message onnx.ModelProto exceeds maximum protobuf size of 2GB:" in error_message
+            or "This protobuf of onnx model is too large (>2GB)" in error_message
+        ):
+
+            # If the model is too large, use external data approach
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_dir_path = Path(temp_dir)
+                model_path = temp_dir_path / "model.onnx"
+                external_data_path = temp_dir_path / "model_data.bin"
+
+                # Save the model copy with external data
+                convert_model_to_external_data(
+                    onnx_model_copy, all_tensors_to_one_file=True, location=external_data_path.name
+                )
+                onnx.save_model(
+                    onnx_model_copy,
+                    str(model_path),
+                    save_as_external_data=True,
+                    all_tensors_to_one_file=True,
+                    location=external_data_path.name,
+                )
+
+                # Check the model using the file path
+                onnx.checker.check_model(str(model_path))
+        else:  # pragma: no cover
+            # If it is a different error, re-raise it
+            raise

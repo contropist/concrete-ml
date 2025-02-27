@@ -4,9 +4,9 @@ on:
   # properly built
   workflow_dispatch:
 
-  # Releases are also allowed to be automatically triggered once the release preparation 
-  # pull-request is merged in main (major/minor releases or release candidates) or in a release 
-  # branch (dot/patch releases). We also make sure that the PR has changes in at least one file 
+  # Releases are also allowed to be automatically triggered once the release preparation
+  # pull-request is merged in main (major/minor releases or release candidates) or in a release
+  # branch (dot/patch releases). We also make sure that the PR has changes in at least one file
   # related to `make set_version` or `make apidocs`
   pull_request:
     types:
@@ -16,34 +16,35 @@ on:
       - 'release/*'
     paths:
       - src/concrete/ml/version.py
-      - 'docs/developer-guide/api/**'
+      - 'docs/references/api/**'
 
 # We need to make sure that the concurrency group is not identical to the continuous-integration.yaml
-# one, else the release workflow will be canceled when calling that latter for tests. More 
+# one, else the release workflow will be canceled when calling that latter for tests. More
 # specifically, we should avoid using the usual "${{ github.ref }}-${{ github.event_name }}-${{ github.workflow }}"
 # group as the 'github.workflow' reference is shared between caller and called workflows, making
-# both workflows have the same concurrency group. Note that the problem happens because 
+# both workflows have the same concurrency group. Note that the problem happens because
 # the continuous-integration.yaml workflow currently cancels all workflows from the same group that
 # are not triggered by a push targeting main, which is the case in the release process
 concurrency:
-  group: "Release"
+  group: "Release ${{ github.ref }}"
   cancel-in-progress: true
 
 env:
   ACTION_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
   BRANCH_NAME: ${{ github.ref_name }}
-  BRANCH_IS_MAIN: ${{ github.ref_name == 'main' }} 
-  BRANCH_IS_RELEASE: ${{ startsWith(github.ref_name, 'release/') }} 
+  BRANCH_IS_MAIN: ${{ github.ref_name == 'main' }}
+  BRANCH_IS_RELEASE: ${{ startsWith(github.ref_name, 'release/') }}
+  SLAB_PROFILE: weekly_ciprofile
 
 jobs:
-  # Open the AWS EC2 instance if the release process has been triggered manually, if the release 
-  # preparation pull-request has been merged or if a pull-request has been merged in a release 
-  # branch. In the second case, we also make sure that the PR contains "Prepare release" in their 
-  # title coming from a branch that starts with "chore/prepare_release_". This workflow will not 
+  # Open the AWS Slab instance if the release process has been triggered manually, if the release
+  # preparation pull-request has been merged or if a pull-request has been merged in a release
+  # branch. In the second case, we also make sure that the PR contains "Prepare release" in their
+  # title coming from a branch that starts with "chore/prepare_release_". This workflow will not
   # be triggered if a pull request preparing a patch release is merged as the PR's title and branch
   # name are expected to be different
   start-runner-linux:
-    name: Start EC2 runner
+    name: Start Slab runner
     if: |
       github.event_name == 'workflow_dispatch'
       || (
@@ -52,48 +53,38 @@ jobs:
         && startsWith(github.head_ref, 'chore/prepare_release_')
         && contains(github.event.pull_request.title, 'Prepare release')
       )
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     outputs:
-      label: ${{ steps.start-ec2-runner.outputs.label }}
-      ec2-instance-id: ${{ steps.start-ec2-runner.outputs.ec2-instance-id || '' }}
+      label: ${{ steps.start-slab-runner.outputs.label }}
+      slab-instance-id: ${{ steps.start-slab-runner.outputs.label || '' }}
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ github.ref }}
           token: ${{ secrets.BOT_TOKEN }}
-  
+
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@010d0da01d0b5a38af31e9c3470dbfdabdecca3a
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Start EC2 runner python
-        id: start-ec2-runner
-        uses: machulav/ec2-github-runner@4e0303de215db88e1c489e07a15ca4d867f488ea
+      - name: Start SLAB runner
+        id: start-slab-runner
+        if: ${{ !cancelled() }}
+        uses: zama-ai/slab-github-runner@79939325c3c429837c10d6041e4fd8589d328bac
         with:
           mode: start
-          github-token: ${{ secrets.EC2_RUNNER_BOT_TOKEN }}
-          ec2-image-id: ${{ secrets.AWS_EC2_AMI }}
-          ec2-instance-type: "c6i.16xlarge"
-          subnet-id: ${{ secrets.AWS_EC2_SUBNET_ID }}
-          security-group-id: ${{ secrets.AWS_EC2_SECURITY_GROUP_ID }}
-          aws-resource-tags: >
-            [
-              {"Key": "Name", "Value": "cml-package-release-ec2-github-runner"},
-              {"Key": "GitHubRepository", "Value": "${{ github.repository }}"},
-              {"Key": "Actor", "Value": "${{ github.actor }}"},
-              {"Key": "Action", "Value": "${{ github.action }}"},
-              {"Key": "GitHash", "Value": "${{ github.sha }}"},
-              {"Key": "RefName", "Value": "${{ github.ref_name }}"},
-              {"Key": "RunId", "Value": "${{ github.run_id }}"},
-              {"Key": "Team", "Value": "CML"}
-            ]
+          github-token: ${{ secrets.SLAB_ACTION_TOKEN }}
+          slab-url: ${{ secrets.SLAB_BASE_URL }}
+          job-secret: ${{ secrets.JOB_SECRET }}
+          backend: aws
+          profile: ${{ env.SLAB_PROFILE }}
 
-  # Check that everything is up to date and run all non-flaky tests on different Python versions 
+  # Check that everything is up to date and run all non-flaky tests on different Python versions
   release-checks:
     name: Install deps and run checks
     needs: [start-runner-linux]
@@ -132,12 +123,21 @@ jobs:
           sed -i 's|^deb http://archive|deb http://fr.archive|g' /etc/apt/sources.list
           apt update && apt install git git-lfs -y
           apt -y install sudo
+          export HOME=/root
 
+      # We need to include LFS files as some are needed for checking the documentation
       - name: Checkout Code
-        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ github.ref }}
           token: ${{ secrets.BOT_TOKEN }}
+          lfs: true
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b
+        id: setup-python
+        with:
+          python-version: 3.8
 
       - name: Install dependencies
         run: |
@@ -145,13 +145,17 @@ jobs:
           sudo apt update
           sudo apt-mark hold docker.io
 
-          ./script/make_utils/setup_os_deps.sh  --linux-install-python
+          export HOME=/root
+          ./script/make_utils/setup_os_deps.sh
+          source $HOME/.bashrc
+
+      - name: Install dependencies part 2
+        run: |
           make setup_env
 
       - name: Check version coherence and apidocs
         run: |
           make check_version_coherence
-          make check_apidocs
 
       - name: Get release version and tag name
         id: get-release-version
@@ -161,12 +165,12 @@ jobs:
           IS_PATCH="$(poetry run python ./script/make_utils/version_utils.py is_patch_release --version "$PROJECT_VERSION")"
           GIT_TAG="v${PROJECT_VERSION}"
 
-          # Release branches are only used for non-release candidates and have a special naming 
+          # Release branches are only used for non-release candidates and have a special naming
           # format (for example, "release/1.1.x" is used for all patch versions related to version 1.1)
           PROJECT_VERSION_MAJOR_MINOR=$(echo "${PROJECT_VERSION}" | cut -d '.' -f -2)
           RELEASE_BRANCH_NAME="release/${PROJECT_VERSION_MAJOR_MINOR}.x"
 
-          # Store project version, tag version, branch name and if they represent a release candidate 
+          # Store project version, tag version, branch name and if they represent a release candidate
           # as environment variables in order to be able to use them in this job's following steps
           echo "PROJECT_VERSION=${PROJECT_VERSION}" >> "$GITHUB_ENV"
           echo "IS_RC=${IS_RC}" >> "$GITHUB_ENV"
@@ -174,7 +178,7 @@ jobs:
           echo "GIT_TAG=${GIT_TAG}" >> "$GITHUB_ENV"
           echo "RELEASE_BRANCH_NAME=${RELEASE_BRANCH_NAME}" >> "$GITHUB_ENV"
 
-          # Store project version, tag version, branch name and if they represent a release 
+          # Store project version, tag version, branch name and if they represent a release
           # candidate as job outputs in order to be able to use them in following jobs
           echo "project_version=${PROJECT_VERSION}" >> "$GITHUB_OUTPUT"
           echo "is_rc=${IS_RC}" >> "$GITHUB_OUTPUT"
@@ -182,7 +186,7 @@ jobs:
           echo "git_tag=${GIT_TAG}" >> "$GITHUB_OUTPUT"
           echo "release_branch_name=${RELEASE_BRANCH_NAME}" >> "$GITHUB_OUTPUT"
 
-      # Make sure that the workflow has been triggered from a release branch if this is a patch 
+      # Make sure that the workflow has been triggered from a release branch if this is a patch
       # release or from main otherwise. If not, the release preparation process is stopped
       # Additionally, for patch releases, if the release branch name does not match the current
       # release version, the release preparation process is stopped as well
@@ -209,21 +213,21 @@ jobs:
           fi
 
       # Make sure that the tag related to the current version does not already exist in the
-      # repository. Otherwise, the version has probably not been updated properly and the release 
+      # repository. Otherwise, the version has probably not been updated properly and the release
       # process is thus stopped
       - name: Check tag does not exist remotely
         run: |
           ./script/actions_utils/check_tag_not_remote.sh --tag_name "${{ env.GIT_TAG }}"
 
-      # Make sure that the branch related to the current version does not already exist in 
-      # the repository if this is a non-rc and non-patch release. Otherwise, the version has 
+      # Make sure that the branch related to the current version does not already exist in
+      # the repository if this is a non-rc and non-patch release. Otherwise, the version has
       # probably not been updated properly and the release process is thus stopped
       - name: Check release branch does not exist remotely
         if:  env.IS_RC == 'false' && env.IS_PATCH == 'false'
         run: |
           ./script/actions_utils/check_branch_not_remote.sh --branch_name "${{ env.RELEASE_BRANCH_NAME }}"
 
-  # The caller workflow's job (here 'release-tests') does not need to run on the current runner as 
+  # The caller workflow's job (here 'release-tests') does not need to run on the current runner as
   # the reusable workflow (here 'continuous-integration.yaml') uses its own runner
   release-tests:
     name: Run tests
@@ -249,7 +253,7 @@ jobs:
 
     steps:
       - name: Import GPG
-        uses: crazy-max/ghaction-import-gpg@v6.0.0
+        uses: crazy-max/ghaction-import-gpg@cb9bde2e2525e640591a934b1fd28eef1dcaf5e5 # v6.2.0
         with:
           gpg_private_key: ${{ secrets.BOT_GPG_PRIVATE_KEY }}
           passphrase: ${{ secrets.BOT_GPG_PASSPHRASE }}
@@ -278,11 +282,11 @@ jobs:
           github_token: ${{ secrets.BOT_TOKEN }}
           branch: ${{ env.TARGET_BRANCH_NAME }}
           tags: true
-  
-  # This action creates docker and pypi images directly on the AWS EC2 instance
-  # The 'PRIVATE_RELEASE_IMAGE_BASE' variable is kept here in case Concrete-ML starts to publish
-  # private nightly releases one day. Currently, release candidates and actual releases are all 
-  # done through the 'PUBLIC_RELEASE_IMAGE_BASE' image. The private image is also used to list all 
+
+  # This action creates docker and pypi images directly on the AWS Slab instance
+  # The 'PRIVATE_RELEASE_IMAGE_BASE' variable is kept here in case Concrete ML starts to publish
+  # private nightly releases one day. Currently, release candidates and actual releases are all
+  # done through the 'PUBLIC_RELEASE_IMAGE_BASE' image. The private image is also used to list all
   # tags easily
   release-package:
     name: Release package and artifacts
@@ -297,11 +301,11 @@ jobs:
       PRIVATE_RELEASE_IMAGE_BASE: ghcr.io/zama-ai/concrete-ml
       PUBLIC_RELEASE_IMAGE_BASE: zamafhe/concrete-ml
       PIP_INDEX_URL: ${{ secrets.PIP_INDEX_URL }}
-      PIP_EXTRA_INDEX_URL: ${{ secrets.PIP_EXTRA_INDEX_URL }}
       GIT_TAG: ${{ needs.release-checks.outputs.git_tag }}
       PROJECT_VERSION: ${{ needs.release-checks.outputs.project_version }}
+      IS_RC: ${{needs.release-checks.outputs.is_rc}}
 
-    # Jobs are separated runners, we therefore need to install dependencies again in order to 
+    # Jobs are separated runners, we therefore need to install dependencies again in order to
     # pursue (without using cache or upload/download them as artifacts)
     steps:
       # Mask internal URLs if logged
@@ -324,14 +328,20 @@ jobs:
           apt -y install sudo
 
       - name: Checkout Code
-        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           ref: ${{ github.ref }}
           token: ${{ secrets.BOT_TOKEN }}
           fetch-depth: 0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@6524bf65af31da8d45b59e8c27de4bd072b392f5 # v3.8.0
+
+      - name: Set up Python
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b
+        id: setup-python
+        with:
+          python-version: 3.8
 
       - name: Install dependencies
         run: |
@@ -339,7 +349,7 @@ jobs:
           sudo apt update
           sudo apt-mark hold docker.io
 
-          ./script/make_utils/setup_os_deps.sh  --linux-install-python
+          ./script/make_utils/setup_os_deps.sh
           make setup_env
 
       - name: Set tags in env
@@ -398,25 +408,14 @@ jobs:
           mkdir -p "${ARTIFACTS_PACKAGED_DIR}"
           echo "ARTIFACTS_PACKAGED_DIR=${ARTIFACTS_PACKAGED_DIR}" >> "$GITHUB_ENV"
 
-      - name: Download Documentation
-        if: ${{ success() && !cancelled() }}
-        id: download-docs
-        uses: actions/download-artifact@9bc31d5ccc31df68ecc42ccf4149144866c47d8a
-        with:
-          name: html-docs
-          path: ${{ env.ARTIFACTS_RAW_DIR }}/html_docs/
-
-      - name: Untar docs artifacts
-        if: ${{ success() && !cancelled() }}
-        run: |
-          cd ${{ steps.download-docs.outputs.download-path }}
-          tar -xvf docs.tar
-          rm docs.tar
+          ARTIFACTS_SLSA_DIR=/tmp/release_artifacts/slsa
+          mkdir -p "${ARTIFACTS_SLSA_DIR}"
+          echo "ARTIFACTS_SLSA_DIR=${ARTIFACTS_SLSA_DIR}" >> "$GITHUB_ENV"
 
       - name: Download changelog
         if: ${{ success() && !cancelled() }}
         id: download-changelog
-        uses: actions/download-artifact@9bc31d5ccc31df68ecc42ccf4149144866c47d8a
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
         with:
           name: changelog
           path: ${{ env.ARTIFACTS_RAW_DIR }}/changelog/
@@ -424,10 +423,18 @@ jobs:
       - name: Download python3 wheel
         if: ${{ success() && !cancelled() }}
         id: download-wheel
-        uses: actions/download-artifact@9bc31d5ccc31df68ecc42ccf4149144866c47d8a
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
         with:
           name: py3-wheel
           path: ${{ env.ARTIFACTS_PACKAGED_DIR }}/
+
+      - name: Download provenance file
+        if: ${{ success() && !cancelled() }}
+        id: download-provenance
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with:
+          pattern: '*.intoto.jsonl'
+          path: ${{ env.ARTIFACTS_SLSA_DIR }}/
 
       - name: Copy wheel to docker build context
         run: |
@@ -435,7 +442,7 @@ jobs:
           cp "${{ env.ARTIFACTS_PACKAGED_DIR }}"/*.whl ./pkg
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@343f7c4344506bcbf9b4de18042ae17996df046d
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567
         with:
           registry: ghcr.io
           username: ${{ secrets.BOT_USERNAME }}
@@ -443,7 +450,7 @@ jobs:
 
       # Login to public DockerHub
       - name: Login to DockerHub
-        uses: docker/login-action@343f7c4344506bcbf9b4de18042ae17996df046d
+        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567
         with:
           username: ${{ secrets.DOCKERHUB_USER }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
@@ -460,9 +467,9 @@ jobs:
           echo "" >> "${SECRETS_FILE}"
           echo "SECRETS_FILE=${SECRETS_FILE}" >> "$GITHUB_ENV"
 
-      - name: Build Docker Concrete-ML Image
+      - name: Build Docker Concrete ML Image
         if: ${{ success() && !cancelled() }}
-        uses: docker/build-push-action@0565240e2d4ab88bba5387d719585280857ece09
+        uses: docker/build-push-action@67a2d409c0a876cbe6b11854e3e25193efe4e62d
         with:
           context: .
           file: docker/Dockerfile.release
@@ -485,60 +492,11 @@ jobs:
           docker run --rm -v "$(pwd)"/docker/release_resources:/data \
           "${PRIVATE_RELEASE_IMG_GIT_TAG}" /bin/bash -c "python ./sanity_check.py"
 
-      - name: Prepare docs push
-        id: docs-push-infos
-        run: |
-          echo "aws-bucket=${{ secrets.AWS_REPO_DOCUMENTATION_BUCKET_NAME }}" >> $GITHUB_OUTPUT
-          echo "aws-distribution=${{ secrets.AWS_REPO_DOCUMENTATION_DISTRIBUTION_ID }}" >> $GITHUB_OUTPUT
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@010d0da01d0b5a38af31e9c3470dbfdabdecca3a
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Update versions.json for docs
+      - name: Create release body
         if: ${{ success() && !cancelled() }}
         env:
-          RAW_DOCS_DIR: ${{ steps.download-docs.outputs.download-path }}
-        run: |
-          DOWNLOADED_VERSIONS_JSON_FILE=$(mktemp --suffix=.json)
-          OUTPUT_VERSIONS_JSON_FILE=$(mktemp --suffix=.json)
-          OPTS=""
-          if [[ $IS_LATEST = "true" ]]; then
-              OPTS="${OPTS} --latest "
-          fi
-
-          aws s3api get-object \
-          --bucket ${{ steps.docs-push-infos.outputs.aws-bucket }} \
-          --key concrete-ml/versions.json "${DOWNLOADED_VERSIONS_JSON_FILE}"
-
-          # shellcheck disable=SC2086
-          poetry run python ./script/actions_utils/generate_versions_json.py \
-          --add-version "${{ env.PROJECT_VERSION }}" \
-          --versions-json-file "${DOWNLOADED_VERSIONS_JSON_FILE}" \
-          --output-json "${OUTPUT_VERSIONS_JSON_FILE}" \
-          $OPTS
-
-
-          echo "OUTPUT_VERSIONS_JSON_FILE=${OUTPUT_VERSIONS_JSON_FILE}" >> "$GITHUB_ENV"
-
-          # Copy to docs to keep a version in docs artifacts
-          cp "${OUTPUT_VERSIONS_JSON_FILE}" "${RAW_DOCS_DIR}"/versions.json
-
-      - name: Create ready to upload/packaged artifacts and release body
-        if: ${{ success() && !cancelled() }}
-        env:
-          RAW_DOCS_DIR: ${{ steps.download-docs.outputs.download-path }}
           RAW_CHANGELOG_DIR: ${{ steps.download-changelog.outputs.download-path }}
         run: |
-          pushd "${RAW_DOCS_DIR}"
-          zip -r "${ARTIFACTS_PACKAGED_DIR}/html-docs.zip" ./*
-          tar -cvzf "${ARTIFACTS_PACKAGED_DIR}/html-docs.tar.gz" ./*
-          # Remove the versions.json to avoid pushing it to S3 but have it in release artifacts
-          rm versions.json
-          popd
           cp "${RAW_CHANGELOG_DIR}"/* "${ARTIFACTS_PACKAGED_DIR}"
           ls -a "${ARTIFACTS_PACKAGED_DIR}"
 
@@ -562,110 +520,86 @@ jobs:
           docker image push --all-tags "${PUBLIC_RELEASE_IMAGE_BASE}"
 
       - name: Push package to PyPi
-        if: ${{ success() && !cancelled() }}
+        if: ${{ (env.IS_RC == 'false') && success() && !cancelled() }}
         run: |
           poetry run twine upload \
           -u __token__ -p ${{ secrets.PYPI_BOT_TOKEN }} \
           -r pypi "${{ env.ARTIFACTS_PACKAGED_DIR }}"/*.whl
 
-      # This step is kept if Concrete ML starts to publish private nightly release one day. For now,
-      # since release candidates and actual releases are public, we don't need to publish anything 
-      # to the private internal repo
+      # Release candidates are pushed to the internal pypi
+      # because it depends on the internal builds of Concrete Python
+      # and pypi doesn't allow external dependencies.
       - name: Push package to Internal PyPi
-        if: false
+        if: ${{ env.IS_RC == 'true' }}
         run: |
           poetry run twine upload \
           -u "${{ secrets.INTERNAL_PYPI_BOT_USERNAME }}" -p "${{ secrets.INTERNAL_PYPI_BOT_PASSWORD }}" \
           --repository-url "${{ secrets.INTERNAL_PYPI_URL }}" "${{ env.ARTIFACTS_PACKAGED_DIR }}"/*.whl
 
-      - name: Push release documentation
-        if: ${{ success() && !cancelled() }}
-        env:
-          AWS_S3_BUCKET: ${{ steps.docs-push-infos.outputs.aws-bucket }}
-          SOURCE_DIR: ${{ steps.download-docs.outputs.download-path }}
-          DEST_DIR: 'concrete-ml/${{ env.PROJECT_VERSION }}'
-        run: |
-          aws s3 sync "${SOURCE_DIR}" s3://"${AWS_S3_BUCKET}/${DEST_DIR}" --delete --acl public-read
-
-      - name: Push release documentation as stable
-        if: ${{ success() && !cancelled() && !fromJSON(env.IS_PRERELEASE) && fromJSON(env.IS_LATEST) }}
-        env:
-          AWS_S3_BUCKET: ${{ steps.docs-push-infos.outputs.aws-bucket }}
-          SOURCE_DIR: ${{ steps.download-docs.outputs.download-path }}
-          DEST_DIR: 'concrete-ml/stable'
-        run: |
-          aws s3 sync "${SOURCE_DIR}" s3://"${AWS_S3_BUCKET}/${DEST_DIR}" --delete --acl public-read
-
-      - name: Invalidate CloudFront Cache for stable
-        if: ${{ success() && !fromJSON(env.IS_PRERELEASE) && fromJSON(env.IS_LATEST) }}
-        env:
-          SOURCE_PATH: "/concrete-ml/stable/*"
-          DISTRIBUTION_ID: ${{ steps.docs-push-infos.outputs.aws-distribution }}
-        run: |
-          aws cloudfront create-invalidation \
-          --distribution-id "${DISTRIBUTION_ID}" \
-          --paths "${SOURCE_PATH}"
-
+      # We can't use softprops/action-gh-release because it's unreliable
+      # with the SLSA files
       - name: Create GitHub release
         if: ${{ success() && !cancelled() }}
         id: create-release
-        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844
-        with:
-          body_path: ${{ env.RELEASE_BODY_FILE }}
-          prerelease: ${{ fromJSON(env.IS_PRERELEASE) }}
-          files: |
-            ${{ env.ARTIFACTS_PACKAGED_DIR }}/*
-          tag_name: ${{ env.GIT_TAG }}
-          fail_on_unmatched_files: true
-          token: ${{ secrets.BOT_TOKEN }}
-
-      - name: Push updated versions.json
-        if: ${{ success() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          aws s3 cp "${OUTPUT_VERSIONS_JSON_FILE}" \
-          s3://${{ steps.docs-push-infos.outputs.aws-bucket }}/concrete-ml/versions.json \
-          --acl public-read
-
-          aws cloudfront create-invalidation \
-          --distribution-id ${{ steps.docs-push-infos.outputs.aws-distribution }} \
-          --paths /concrete-ml/versions.json
+          if [[ "${{ env.IS_PRERELEASE }}" == "true" ]];
+          then
+            gh release create \
+            --prerelease \
+            --notes-file ${{ env.RELEASE_BODY_FILE }} \
+            --repo ${{ github.repository }} \
+            --verify-tag ${{ env.GIT_TAG }} \
+            --title ${{ env.GIT_TAG }} \
+            ${{ env.ARTIFACTS_PACKAGED_DIR }}/* \
+            ${{ env.ARTIFACTS_SLSA_DIR }}/*.intoto.jsonl/*
+          else
+            gh release create \
+            --notes-file ${{ env.RELEASE_BODY_FILE }} \
+            --repo ${{ github.repository }} \
+            --verify-tag ${{ env.GIT_TAG }} \
+            --title ${{ env.GIT_TAG }} \
+            ${{ env.ARTIFACTS_PACKAGED_DIR }}/* \
+            ${{ env.ARTIFACTS_SLSA_DIR }}/*.intoto.jsonl/*
+          fi
 
       - name: Get release link
         id: get-release-link
         run: |
           echo "RELEASE_URL=${{ steps.create-release.outputs.url }}" >> $GITHUB_ENV
-  
 
-  # Close the AWS EC2 instance
+
+  # Close the AWS Slab instance
   stop-runner-linux:
-    name: Stop EC2 runner
+    name: Stop Slab runner
     needs: [start-runner-linux, release-package]
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     if: ${{ always() && (needs.start-runner-linux.result != 'skipped') }}
     steps:
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@010d0da01d0b5a38af31e9c3470dbfdabdecca3a
+        uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Stop EC2 runner
-        uses: machulav/ec2-github-runner@4e0303de215db88e1c489e07a15ca4d867f488ea
-        if: ${{ always() && needs.start-runner-linux.outputs.ec2-instance-id }}
+      - name: Stop Slab runner python
+        if: ${{ always() && needs.start-runner-linux.outputs.slab-instance-id }}
+        uses: zama-ai/slab-github-runner@79939325c3c429837c10d6041e4fd8589d328bac
         with:
-          github-token: ${{ secrets.EC2_RUNNER_BOT_TOKEN }}
-          label: ${{ needs.start-runner-linux.outputs.label }}
-          ec2-instance-id: ${{ needs.start-runner-linux.outputs.ec2-instance-id }}
           mode: stop
-
+          github-token: ${{ secrets.SLAB_ACTION_TOKEN }}
+          slab-url: ${{ secrets.SLAB_BASE_URL }}
+          job-secret: ${{ secrets.JOB_SECRET }}
+          label: ${{ needs.start-runner-linux.outputs.slab-instance-id }}
 
   # Report the final status on Slack
   send-report:
     name: Send Slack notification
     if: ${{ always() }}
     timeout-minutes: 2
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     needs:
       [
         start-runner-linux,
@@ -678,7 +612,7 @@ jobs:
       GIT_TAG: ${{ needs.release-checks.outputs.git_tag }}
 
     steps:
-      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Prepare whole job status
         if: ${{ always() }}
@@ -694,12 +628,12 @@ jobs:
       - name: Slack Notification
         if: ${{ always() }}
         continue-on-error: true
-        uses: rtCamp/action-slack-notify@b24d75fe0e728a4bf9fc42ee217caa686d141ee8
+        uses: rtCamp/action-slack-notify@c33737706dea87cd7784c687dadc9adf1be59990
         env:
           SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
           SLACK_ICON: https://pbs.twimg.com/profile_images/1274014582265298945/OjBKP9kn_400x400.png
           SLACK_COLOR: ${{ env.JOB_STATUS || 'failure' }}
-          SLACK_MESSAGE: "Creating release for ${{ env.GIT_TAG }} finished with status\ 
+          SLACK_MESSAGE: "Creating release for ${{ env.GIT_TAG }} finished with status: \
             ${{ env.JOB_STATUS || 'failure' }} (${{ env.ACTION_RUN_URL }})\n\
             - start-runner-linux: ${{ needs.start-runner-linux.result || 'Did not run.'}}\n\n\
             - release-checks: ${{ needs.release-checks.result || 'Did not run.' }}\n\n\

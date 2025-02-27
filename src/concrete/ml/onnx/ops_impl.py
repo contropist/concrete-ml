@@ -8,23 +8,28 @@ import numpy
 import onnx
 import onnx.helper
 from brevitas.function import max_int, min_int
-from concrete.fhe import conv as cnp_conv
-from concrete.fhe import maxpool as cnp_maxpool
+from concrete.fhe import conv as fhe_conv
+from concrete.fhe import maxpool as fhe_maxpool
 from concrete.fhe import univariate
 from scipy import special
 from typing_extensions import SupportsIndex
 
-from ..common import utils
-from ..common.debugging import assert_false, assert_true
-from .onnx_impl_utils import (
+# pylint: disable=ungrouped-imports
+from concrete.ml.common import utils
+from concrete.ml.common.debugging import assert_false, assert_true
+from concrete.ml.onnx.onnx_impl_utils import (
     compute_onnx_pool_padding,
     numpy_onnx_pad,
     onnx_avgpool_compute_norm_const,
+    rounded_comparison,
 )
 
 
 class RawOpOutput(numpy.ndarray):
-    """Type construct that marks an ndarray as a raw output of a quantized op."""
+    """Type construct that marks an ndarray as a raw output of a quantized op.
+
+    A raw output is an output that is a clear constant such as a shape, a constant float, an index..
+    """
 
 
 # This function is only used for comparison operators that return boolean values by default.
@@ -286,23 +291,7 @@ def numpy_gemm(
     b_prime = numpy.transpose(b) if transB else b
     c_prime: Union[numpy.ndarray, float] = c if c is not None else 0
 
-    # Do
-    #
-    #       y = processed_alpha * numpy.matmul(a_prime, b_prime) + processed_beta * c_prime
-    #
-    # in an efficient way, i.e., to make tracing directly optimized, without expecting any opt from
-    # the compiler here
-
-    y = numpy.matmul(a_prime, b_prime)
-
-    if processed_alpha != 1:
-        y = y * processed_alpha
-
-    if numpy.any(c_prime != 0):
-        if processed_beta == 1:
-            y = y + c_prime
-        else:
-            y = y + processed_beta * c_prime
+    y = processed_alpha * numpy.matmul(a_prime, b_prime) + processed_beta * c_prime
 
     return (y,)
 
@@ -354,7 +343,7 @@ def numpy_sigmoid(
     Returns:
         Tuple[numpy.ndarray]: Output tensor
     """
-    return (1.0 / (1.0 + numpy.exp(-x)),)
+    return (numpy.exp(-numpy.logaddexp(0, -x)),)
 
 
 def numpy_softmax(x, axis=1, keepdims=True):
@@ -897,8 +886,65 @@ def numpy_equal(
     Returns:
         Tuple[numpy.ndarray]: Output tensor
     """
-
     return (numpy.equal(x, y),)
+
+
+# Remove `# pragma: no cover` once the following issue will be resolved
+# FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4179
+def rounded_numpy_equal_for_trees(
+    x: numpy.ndarray,
+    y: numpy.ndarray,
+    *,
+    lsbs_to_remove_for_trees: Optional[int] = None,
+) -> Tuple[numpy.ndarray]:
+    """Compute rounded equal in numpy according to ONNX spec for tree-based models only.
+
+    See https://github.com/onnx/onnx/blob/main/docs/Changelog.md#Equal-11
+
+    Args:
+        x (numpy.ndarray): Input tensor
+        y (numpy.ndarray): Input tensor
+        lsbs_to_remove_for_trees (Optional[int]): Number of the least significant bits to remove
+            for tree-based models only.
+
+    Returns:
+        Tuple[numpy.ndarray]: Output tensor
+    """
+
+    # For tree-based models in the second stage, x == y is equivalent to x <= y
+    # Because y is the max sum, see this paper: https://arxiv.org/pdf/2010.04804.pdf
+    # The approach x <= y, is equivalent to:
+    # option 1: x - y <= 0 => round_bit_pattern(x - y + half) <= 0 or
+    # option 2: y - x >= 0 => round_bit_pattern(y - x - half) >= 0
+
+    # Option 2 is selected because it adheres to the established pattern in `rounded_comparison`
+    # which does: (a - b) - half.
+    if lsbs_to_remove_for_trees is not None and lsbs_to_remove_for_trees > 0:
+        return rounded_comparison(
+            y, x, lsbs_to_remove_for_trees, operation=lambda x: x >= 0
+        )  # pragma: no cover
+
+    # Else, default numpy_equal operator
+    return (numpy.equal(x, y),)
+
+
+def numpy_equal_float(
+    x: numpy.ndarray,
+    y: numpy.ndarray,
+) -> Tuple[numpy.ndarray]:
+    """Compute equal in numpy according to ONNX spec and cast outputs to floats.
+
+    See https://github.com/onnx/onnx/blob/main/docs/Changelog.md#Equal-13
+
+    Args:
+        x (numpy.ndarray): Input tensor
+        y (numpy.ndarray): Input tensor
+
+    Returns:
+        Tuple[numpy.ndarray]: Output tensor
+    """
+
+    return cast_to_float(numpy_equal(x, y))
 
 
 def numpy_not(
@@ -1026,8 +1072,36 @@ def numpy_less(
     Returns:
         Tuple[numpy.ndarray]: Output tensor
     """
-
     return (numpy.less(x, y),)
+
+
+def rounded_numpy_less_for_trees(
+    x: numpy.ndarray,
+    y: numpy.ndarray,
+    *,
+    lsbs_to_remove_for_trees: Optional[int] = None,
+) -> Tuple[numpy.ndarray]:
+    """Compute rounded less in numpy according to ONNX spec for tree-based models only.
+
+    See https://github.com/onnx/onnx/blob/main/docs/Changelog.md#Less-13
+
+    Args:
+        x (numpy.ndarray): Input tensor
+        y (numpy.ndarray): Input tensor
+        lsbs_to_remove_for_trees (Optional[int]): Number of the least significant bits to remove
+            for tree-based models only.
+
+    Returns:
+        Tuple[numpy.ndarray]: Output tensor
+    """
+
+    # numpy.less(x, y) is equivalent to :
+    # x - y <= 0 => round_bit_pattern(x - y - half) < 0
+    if lsbs_to_remove_for_trees is not None and lsbs_to_remove_for_trees > 0:
+        return rounded_comparison(x, y, lsbs_to_remove_for_trees, operation=lambda x: x < 0)
+
+    # Else, default numpy_less operator
+    return numpy_less(x, y)
 
 
 def numpy_less_float(
@@ -1066,6 +1140,39 @@ def numpy_less_or_equal(
     """
 
     return (numpy.less_equal(x, y),)
+
+
+def rounded_numpy_less_or_equal_for_trees(
+    x: numpy.ndarray,
+    y: numpy.ndarray,
+    *,
+    lsbs_to_remove_for_trees: Optional[int] = None,
+) -> Tuple[numpy.ndarray]:
+    """Compute rounded less or equal in numpy according to ONNX spec for tree-based models only.
+
+    See https://github.com/onnx/onnx/blob/main/docs/Changelog.md#LessOrEqual-12
+
+    Args:
+        x (numpy.ndarray): Input tensor
+        y (numpy.ndarray): Input tensor
+        lsbs_to_remove_for_trees (Optional[int]): Number of the least significant bits to remove
+            for tree-based models only.
+
+    Returns:
+        Tuple[numpy.ndarray]: Output tensor
+    """
+
+    # numpy.less_equal(x, y) <= y is equivalent to :
+    # option 1: x - y <= 0 => round_bit_pattern(x - y + half) <= 0 or
+    # option 2: y - x >= 0 => round_bit_pattern(y - x - half) >= 0
+
+    # Option 2 is selected because it adheres to the established pattern in `rounded_comparison`
+    # which does: (a - b) - half.
+    if lsbs_to_remove_for_trees is not None and lsbs_to_remove_for_trees > 0:
+        return rounded_comparison(y, x, lsbs_to_remove_for_trees, operation=lambda x: x >= 0)
+
+    # Else, default numpy_less_or_equal operator
+    return numpy_less_or_equal(x, y)
 
 
 def numpy_less_or_equal_float(
@@ -1175,7 +1282,10 @@ def numpy_conv(
     """
 
     # Convert the inputs to tensors to compute conv using torch
-    assert_true(len(kernel_shape) == 2, "The convolution operator currently supports only 2-d")
+    assert_true(
+        len(kernel_shape) in (1, 2),
+        f"The convolution operator currently only supports 1d or 2d. Got {len(kernel_shape)}-d",
+    )
     assert_true(
         bool(numpy.all(numpy.asarray(dilations) == 1)),
         "The convolution operator in Concrete does not support dilation",
@@ -1196,8 +1306,33 @@ def numpy_conv(
     # Pad the input if needed
     x_pad = numpy_onnx_pad(x, pads)
 
+    is_conv1d = len(kernel_shape) == 1
+
+    # Workaround for handling torch's Conv1d operator until it is supported by Concrete Python
+    # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4117
+    if is_conv1d:
+        x_pad = numpy.expand_dims(x_pad, axis=-2)
+        w = numpy.expand_dims(w, axis=-2)
+        kernel_shape = (1, kernel_shape[0])
+        strides = (1, strides[0])
+        dilations = (1, dilations[0])
+
     # Compute the torch convolution
-    res = cnp_conv(x_pad, w, b, None, strides, dilations, None, group)
+    res = fhe_conv(
+        x=x_pad,
+        weight=w,
+        bias=b,
+        pads=None,
+        strides=strides,
+        dilations=dilations,
+        kernel_shape=kernel_shape,
+        group=group,
+    )
+
+    # Workaround for handling torch's Conv1d operator until it is supported by Concrete Python
+    # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4117
+    if is_conv1d:
+        res = numpy.squeeze(res, axis=-2)
 
     return (res,)
 
@@ -1205,10 +1340,12 @@ def numpy_conv(
 def numpy_avgpool(
     x: numpy.ndarray,
     *,
-    ceil_mode: int,
     kernel_shape: Tuple[int, ...],
-    pads: Tuple[int, ...] = None,
-    strides: Tuple[int, ...] = None,
+    auto_pad: str = "NOTSET",
+    ceil_mode: int = 0,
+    count_include_pad: int = 1,
+    pads: Optional[Tuple[int, ...]] = None,
+    strides: Optional[Tuple[int, ...]] = None,
 ) -> Tuple[numpy.ndarray]:
     """Compute Average Pooling using Torch.
 
@@ -1217,29 +1354,55 @@ def numpy_avgpool(
     See: https://github.com/onnx/onnx/blob/main/docs/Operators.md#AveragePool
 
     Args:
-        x (numpy.ndarray): input data (many dtypes are supported). Shape is N x C x H x W for 2d
-        ceil_mode (int): ONNX rounding parameter, expected 0 (torch style dimension computation)
-        kernel_shape (Tuple[int, ...]): shape of the kernel. Should have 2 elements for 2d conv
-        pads (Tuple[int, ...]): padding in ONNX format (begin, end) on each axis
-        strides (Tuple[int, ...]): stride of the convolution on each axis
+        x (numpy.ndarray): Input data of shape (N, C, H, W), as only 2D inputs are currently
+            supported.
+        kernel_shape (Tuple[int, ...]): The size of the kernel along each axis. Currently, only 2D
+            kernels are supported.
+        auto_pad (str): Only the default "NOTSET" value is currently supported, which means
+            explicit padding is used.
+        ceil_mode (int): Whether to use ONNX's ceil (1) or floor (0, the default) to compute the
+            output shape.
+        count_include_pad (int): Whether include pad pixels when calculating values for the edges.
+            Currently, setting this parameter to 0 is not supported in Concrete ML.
+        pads (Tuple[int, ...]): Padding for the beginning and ending along each spatial axis.
+            Expected format is [x1_begin, x2_begin...x1_end, x2_end, ...] where xi_begin (resp.
+            xi_end) is the number of pixels added at the beginning (resp. end) of axis `i`.
+        strides (Tuple[int, ...]): Stride along each spatial axis. If not present, the stride
+            defaults to 1 along each spatial axis.
 
     Returns:
         res (numpy.ndarray): a tensor of size (N x InChannels x OutHeight x OutWidth).
            See https://pytorch.org/docs/stable/generated/torch.nn.AvgPool2d.html
-
-    Raises:
-        AssertionError: if the pooling arguments are wrong
     """
 
-    assert_true(len(kernel_shape) == 2, "The average pool operator currently supports only 2-d")
+    assert_true(
+        auto_pad == "NOTSET",
+        "The 'auto_pad' parameter is not supported. Please keep the the default 'NOTSET' value and "
+        "provide explicit padding.",
+    )
 
-    # For mypy
-    assert pads is None or len(pads) == 4
+    assert_true(
+        len(kernel_shape) == 2, "The Average Pool operator currently supports only 2d kernels."
+    )
 
-    # For mypy
-    assert len(kernel_shape) == 2
+    assert_true(
+        count_include_pad == 1,
+        "Pad pixels must be included when calculating values on the edges. Please set "
+        "'count_include_pad' to 1.",
+    )
 
-    assert strides is None or len(strides) == 2
+    assert_true(
+        strides is None or len(kernel_shape) == len(strides),
+        "The Average Pool operator requires the number of strides to be the same as the number of "
+        "kernel dimensions.",
+    )
+
+    assert_true(
+        pads is None or len(pads) == 2 * len(kernel_shape),
+        "The Average Pool operator in Concrete ML requires padding to be specified as "
+        " (pad_left_dim1, pad_right_dim1, pad_left_dim2, pad_right_dim2, ...), following ONNX"
+        " standard.",
+    )
 
     # Use default values if the ONNX did not set these parameters
     pads = (0, 0, 0, 0) if pads is None else pads
@@ -1261,7 +1424,7 @@ def numpy_avgpool(
     q_input_pad = numpy_onnx_pad(x, pool_pads)
 
     # Compute the sums of input values for each kernel position
-    res = cnp_conv(q_input_pad, kernel, None, [0, 0, 0, 0], strides, None, None, n_in_channels)
+    res = fhe_conv(q_input_pad, kernel, None, [0, 0, 0, 0], strides, None, None, n_in_channels)
 
     # Compute the average of the input values for each kernel position
     res /= norm_const
@@ -1325,7 +1488,7 @@ def numpy_maxpool(
     q_input_pad = numpy_onnx_pad(x, pool_pads)
 
     fake_pads = [0] * len(pads)
-    res = cnp_maxpool(
+    res = fhe_maxpool(
         q_input_pad,
         kernel_shape=kernel_shape,
         strides=strides,
@@ -1375,9 +1538,9 @@ def numpy_pad(
 def numpy_cast(data: numpy.ndarray, *, to: int) -> Tuple[numpy.ndarray]:
     """Execute ONNX cast in Numpy.
 
-    For traced values during compilation, it supports only booleans, which are converted to float.
-    For raw values (used in constant folding or shape computations), any cast is allowed.
-
+    This function supports casting to booleans, floats, and double for traced values,
+    converting them accordingly. For raw values (used in constant folding or shape computations),
+    any cast is allowed.
     See: https://github.com/onnx/onnx/blob/main/docs/Operators.md#Cast
 
     Args:
@@ -1391,7 +1554,12 @@ def numpy_cast(data: numpy.ndarray, *, to: int) -> Tuple[numpy.ndarray]:
     if isinstance(data, RawOpOutput):
         return (data.astype(onnx.helper.tensor_dtype_to_np_dtype(to)).view(RawOpOutput),)
 
-    assert_true(to == onnx.TensorProto.BOOL)
+    allowed_types = (onnx.TensorProto.BOOL, onnx.TensorProto.FLOAT, onnx.TensorProto.DOUBLE)
+    assert to in allowed_types, (
+        f"Invalid 'to' data type: {onnx.TensorProto.DataType.Name(to)}. "
+        f"Only {', '.join(onnx.TensorProto.DataType.Name(t) for t in allowed_types)}"
+        "are allowed for casting."
+    )
 
     # Will be used for traced values
     return (data.astype(numpy.float64),)
@@ -1428,7 +1596,7 @@ def numpy_batchnorm(
         training_mode (int): if the model was exported in training mode this is set to 1, else 0
 
     Returns:
-        numpy.ndarray: Normalized tensor
+        numpy.ndarray: Normalized tenso
     """
 
     assert_true(
@@ -1640,10 +1808,17 @@ def numpy_brevitas_quant(
     assert_true(signed in (1, 0), "Signed flag in Brevitas quantizer must be 0/1")
     assert_true(narrow in (1, 0), "Narrow range flag in Brevitas quantizer must be 0/1")
 
+    # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4544
+    # Remove this workaround when brevitas export is fixed
+    if signed == 0 and narrow == 1:
+        signed = 1
+        narrow = 0
+
     assert_false(
         signed == 0 and narrow == 1,
         "Can not use narrow range for non-signed Brevitas quantizers",
     )
+
     # Compute the re-scaled values
     y = x / scale
     y = y + zero_point
@@ -1942,3 +2117,151 @@ def numpy_gather(
     slices = tuple(slice(None) if i != axis else indices_list for i in range(x.ndim))
 
     return (x[slices],)
+
+
+@onnx_func_raw_args("shape")
+def numpy_expand(x: numpy.ndarray, shape: Optional[Tuple[int]] = None) -> Tuple[numpy.ndarray]:
+    """Apply the expand operator in numpy according to ONNX spec.
+
+    See https://github.com/onnx/onnx/blob/main/docs/Operators.md#expand
+
+    Args:
+        x (numpy.ndarray): Input tensor.
+        shape (Optional[Tuple[int]]): Tuple of the new shape.
+
+    Returns:
+        Tuple[numpy.ndarray]: Output tensor.
+    """
+    target_shape = numpy.array(shape, dtype=int)
+    shape_difference = len(target_shape) - len(x.shape)
+
+    assert_true(shape_difference >= 0, "Target shape cannot have fewer dimensions than input shape")
+
+    return (numpy.broadcast_to(x, target_shape),)
+
+
+def numpy_unfold(
+    x: numpy.ndarray,
+    *,
+    kernel_shape: Tuple[int, ...],
+    pads: Tuple[int, ...] = None,
+    strides: Tuple[int, ...] = None,
+) -> Tuple[numpy.ndarray]:
+    """Compute Unfold using Torch.
+
+    Currently supports 2d Unfold with torch semantics. This function is ONNX compatible.
+
+    See: https://github.com/onnx/onnx/blob/main/docs/Operators.md
+
+    Args:
+        x (numpy.ndarray): input data (many dtypes are supported). Shape is N x C x H x W for 2d
+        kernel_shape (Tuple[int, ...]): shape of the kernel. Should have 2 elements for 2d conv
+        pads (Tuple[int, ...]): padding in ONNX format (begin, end) on each axis
+        strides (Tuple[int, ...]): stride of the convolution on each axis
+
+    Returns:
+        res (numpy.ndarray): a tensor of size (N x InChannels x OutHeight * OutWidth).
+           See https://pytorch.org/docs/stable/generated/torch.nn.Unfold.html
+
+    Raises:
+        AssertionError: if the unfold arguments are wrong
+    """
+
+    assert_true(len(kernel_shape) == 2, "The unfold operator currently supports only 2-d")
+
+    # For mypy
+    assert pads is None or len(pads) == 4
+
+    # For mypy
+    assert len(kernel_shape) == 2
+
+    assert strides is None or len(strides) == 2
+
+    # Use default values if the ONNX did not set these parameters
+    pads = (0, 0, 0, 0) if pads is None else pads
+    strides = (1, 1) if strides is None else strides
+
+    # Compute the unfold using a grouped convolution (groups = input channels)
+    # This means that each slice of the kernel is applied on each input channel respectively
+    # We create kernels with only one one at each position, which will redirect the kernel
+    # outputs to the output channels
+    n_in_channels = x.shape[1]
+    kernels_list = []
+    for _ in range(n_in_channels):
+        for row in range(kernel_shape[0]):
+            for col in range(kernel_shape[1]):
+                kernel = numpy.zeros(
+                    (1, 1, kernel_shape[0], kernel_shape[1]),
+                    dtype=numpy.int64,
+                )
+                kernel[:, :, row, col] = 1
+                kernels_list.append(kernel)
+    kernels = numpy.concatenate(numpy.array(kernels_list), axis=0)
+
+    # Pad the input tensor
+    pool_pads = compute_onnx_pool_padding(x.shape, kernel_shape, pads, strides, ceil_mode=0)
+    q_input_pad = numpy_onnx_pad(x, pool_pads)
+
+    # Compute the kernels of input values for each kernel position
+    res = fhe_conv(q_input_pad, kernels, None, [0, 0, 0, 0], strides, None, None, n_in_channels)
+
+    # reshape to fit the torch.F.unfold function output shapes
+    res = res.reshape((res.shape[0], res.shape[1], -1))
+
+    return (res,)
+
+
+@onnx_func_raw_args("depth")
+def numpy_onehot(
+    indices: numpy.ndarray,
+    depth: Union[int, numpy.ndarray],
+    values: numpy.ndarray,
+    *,
+    axis: int = -1,
+) -> Tuple[numpy.ndarray]:
+    """Compute OneHot in numpy according to ONNX spec.
+
+    See https://github.com/onnx/onnx/blob/main/docs/Operators.md#OneHot
+
+    Args:
+        indices (numpy.ndarray): Input tensor containing indices.
+        depth (Union[int, numpy.ndarray]): Scalar or 1D tensor with one element,
+            specifying the number of classes in one-hot tensor.
+        values (numpy.ndarray): Rank 1 tensor containing exactly two elements:
+            [off_value, on_value].
+        axis (int): Axis along which one-hot representation is added.
+            Defaults to -1 (last dimension).
+
+    Returns:
+        Tuple[numpy.ndarray]: One-hot encoded tensor.
+
+    """
+
+    # Ensure indices are integers
+    assert_true(numpy.all(indices % 1 == 0), "Indices must be integers")
+    indices = numpy.asarray(indices).astype(numpy.int64)
+
+    # Ensure depth is an integer
+    assert_true(numpy.all(depth % 1 == 0), "Depth must be an integer")
+    depth = int(numpy.asarray(depth).item())
+
+    # Clip indices to valid range
+    indices = numpy.clip(indices, -depth, depth - 1)
+
+    # Create the output shape
+    output_shape = list(indices.shape)
+    output_shape.insert(axis if axis >= 0 else len(output_shape) + 1 + axis, depth)
+
+    # Create a zero matrix
+    one_hot = numpy.zeros(output_shape, dtype=values.dtype)
+
+    # Create an array of indices for all dimensions
+    idx = list(numpy.indices(indices.shape))
+    idx.insert(axis if axis >= 0 else len(idx) + 1 + axis, indices)
+
+    # Set the on_value at the appropriate indices
+    one_hot[tuple(idx)] = 1
+
+    # Scale the one-hot encoded array using the provided values
+    off_value, on_value = values
+    return ((one_hot * (on_value - off_value) + off_value),)

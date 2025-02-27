@@ -1,4 +1,5 @@
 """Optimization passes for QuantizedModules."""
+
 from collections import defaultdict
 from typing import DefaultDict, Dict, List, Optional, Tuple
 
@@ -101,7 +102,7 @@ class PowerOfTwoScalingRoundPBSAdapter:
         # Initialize the list of predecessors with tensors that are graph inputs
         predecessors: PredecessorsType = defaultdict(list)
 
-        for (node_inputs, node_op) in self._qmodule.quant_layers_dict.values():
+        for node_inputs, node_op in self._qmodule.quant_layers_dict.values():
             # The first input node contains the encrypted data
             enc_input_node = node_inputs[0]
 
@@ -168,7 +169,7 @@ class PowerOfTwoScalingRoundPBSAdapter:
         valid_paths: PatternDict = {}
 
         # pylint: disable-next=too-many-nested-blocks
-        for (_, node_op) in self._qmodule.quant_layers_dict.values():
+        for _, node_op in self._qmodule.quant_layers_dict.values():
             # Only work with supported nodes that have a single
             # encrypted input (not supporting enc x enc matmul)
             if (
@@ -294,7 +295,9 @@ class PowerOfTwoScalingRoundPBSAdapter:
                 lsbs_to_round = -(log2_input + log2_weights - log2_output)
                 if lsbs_to_round > 0:
                     path_start_node.rounding_threshold_bits = lsbs_to_round
-                    path_start_node.lsbs_to_remove = lsbs_to_round
+                    # For mypy
+                    assert isinstance(path_start_node.lsbs_to_remove, dict)
+                    path_start_node.lsbs_to_remove["matmul"] = lsbs_to_round
             else:
                 invalid_paths.append(path_start_node)
 

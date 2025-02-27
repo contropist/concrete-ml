@@ -1,5 +1,6 @@
 """Implement RandomForest models."""
-from typing import Any, Dict
+
+from typing import Any, Dict, Union
 
 import numpy
 import sklearn.ensemble
@@ -19,7 +20,7 @@ class RandomForestClassifier(BaseTreeClassifierMixin):
     # pylint: disable-next=too-many-arguments
     def __init__(
         self,
-        n_bits: int = 6,
+        n_bits: Union[int, Dict[str, int]] = 6,
         n_estimators=20,
         criterion="gini",
         max_depth=4,
@@ -38,6 +39,7 @@ class RandomForestClassifier(BaseTreeClassifierMixin):
         class_weight=None,
         ccp_alpha=0.0,
         max_samples=None,
+        monotonic_cst=None,
     ):
         """Initialize the RandomForestClassifier.
 
@@ -64,6 +66,7 @@ class RandomForestClassifier(BaseTreeClassifierMixin):
         self.max_leaf_nodes = max_leaf_nodes
         self.min_impurity_decrease = min_impurity_decrease
         self.ccp_alpha = ccp_alpha
+        self.monotonic_cst = monotonic_cst
 
     def post_processing(self, y_preds: numpy.ndarray) -> numpy.ndarray:
         # Here, we want to use BaseTreeEstimatorMixin's `post-processing` method as
@@ -74,7 +77,7 @@ class RandomForestClassifier(BaseTreeClassifierMixin):
     def dump_dict(self) -> Dict[str, Any]:
         metadata: Dict[str, Any] = {}
 
-        # Concrete-ML
+        # Concrete ML
         metadata["n_bits"] = self.n_bits
         metadata["sklearn_model"] = self.sklearn_model
         metadata["_is_fitted"] = self._is_fitted
@@ -84,6 +87,7 @@ class RandomForestClassifier(BaseTreeClassifierMixin):
         metadata["onnx_model_"] = self.onnx_model_
         metadata["framework"] = self.framework
         metadata["post_processing_params"] = self.post_processing_params
+        metadata["_fhe_ensembling"] = self._fhe_ensembling
 
         # Scikit-Learn
         metadata["n_estimators"] = self.n_estimators
@@ -104,6 +108,7 @@ class RandomForestClassifier(BaseTreeClassifierMixin):
         metadata["max_leaf_nodes"] = self.max_leaf_nodes
         metadata["min_impurity_decrease"] = self.min_impurity_decrease
         metadata["ccp_alpha"] = self.ccp_alpha
+        metadata["monotonic_cst"] = self.monotonic_cst
 
         return metadata
 
@@ -112,18 +117,22 @@ class RandomForestClassifier(BaseTreeClassifierMixin):
         # Instantiate the model
         obj = RandomForestClassifier(n_bits=metadata["n_bits"])
 
-        # Concrete-ML
+        # Concrete ML
         obj.sklearn_model = metadata["sklearn_model"]
         obj._is_fitted = metadata["_is_fitted"]
         obj._is_compiled = metadata["_is_compiled"]
         obj.input_quantizers = metadata["input_quantizers"]
         obj.framework = metadata["framework"]
-        obj._tree_inference, obj.output_quantizers, obj.onnx_model_ = tree_to_numpy(
+        obj.onnx_model_ = metadata["onnx_model_"]
+        obj.output_quantizers = metadata["output_quantizers"]
+        obj._fhe_ensembling = metadata["_fhe_ensembling"]
+        obj._tree_inference = tree_to_numpy(
             obj.sklearn_model,
             numpy.zeros((len(obj.input_quantizers),))[None, ...],
             framework=obj.framework,
-            output_n_bits=obj.n_bits,
-        )
+            output_n_bits=obj.n_bits["op_leaves"] if isinstance(obj.n_bits, Dict) else obj.n_bits,
+            fhe_ensembling=obj._fhe_ensembling,
+        )[0]
         obj.post_processing_params = metadata["post_processing_params"]
 
         # Scikit-Learn
@@ -145,6 +154,7 @@ class RandomForestClassifier(BaseTreeClassifierMixin):
         obj.max_leaf_nodes = metadata["max_leaf_nodes"]
         obj.min_impurity_decrease = metadata["min_impurity_decrease"]
         obj.ccp_alpha = metadata["ccp_alpha"]
+        obj.monotonic_cst = metadata["monotonic_cst"]
 
         return obj
 
@@ -160,14 +170,14 @@ class RandomForestRegressor(BaseTreeRegressorMixin):
     # pylint: disable-next=too-many-arguments
     def __init__(
         self,
-        n_bits: int = 6,
+        n_bits: Union[int, Dict[str, int]] = 6,
         n_estimators=20,
         criterion="squared_error",
         max_depth=4,
         min_samples_split=2,
         min_samples_leaf=1,
         min_weight_fraction_leaf=0.0,
-        max_features="sqrt",
+        max_features=1.0,
         max_leaf_nodes=None,
         min_impurity_decrease=0.0,
         bootstrap=True,
@@ -178,6 +188,7 @@ class RandomForestRegressor(BaseTreeRegressorMixin):
         warm_start=False,
         ccp_alpha=0.0,
         max_samples=None,
+        monotonic_cst=None,
     ):
         """Initialize the RandomForestRegressor.
 
@@ -203,11 +214,12 @@ class RandomForestRegressor(BaseTreeRegressorMixin):
         self.max_leaf_nodes = max_leaf_nodes
         self.min_impurity_decrease = min_impurity_decrease
         self.ccp_alpha = ccp_alpha
+        self.monotonic_cst = monotonic_cst
 
     def dump_dict(self) -> Dict[str, Any]:
         metadata: Dict[str, Any] = {}
 
-        # Concrete-ML
+        # Concrete ML
         metadata["n_bits"] = self.n_bits
         metadata["sklearn_model"] = self.sklearn_model
         metadata["_is_fitted"] = self._is_fitted
@@ -217,6 +229,7 @@ class RandomForestRegressor(BaseTreeRegressorMixin):
         metadata["onnx_model_"] = self.onnx_model_
         metadata["framework"] = self.framework
         metadata["post_processing_params"] = self.post_processing_params
+        metadata["_fhe_ensembling"] = self._fhe_ensembling
 
         # Scikit-Learn
         metadata["n_estimators"] = self.n_estimators
@@ -236,6 +249,7 @@ class RandomForestRegressor(BaseTreeRegressorMixin):
         metadata["max_leaf_nodes"] = self.max_leaf_nodes
         metadata["min_impurity_decrease"] = self.min_impurity_decrease
         metadata["ccp_alpha"] = self.ccp_alpha
+        metadata["monotonic_cst"] = self.monotonic_cst
 
         return metadata
 
@@ -245,18 +259,22 @@ class RandomForestRegressor(BaseTreeRegressorMixin):
         # Instantiate the model
         obj = RandomForestRegressor(n_bits=metadata["n_bits"])
 
-        # Concrete-ML
+        # Concrete ML
         obj.sklearn_model = metadata["sklearn_model"]
         obj._is_fitted = metadata["_is_fitted"]
         obj._is_compiled = metadata["_is_compiled"]
         obj.input_quantizers = metadata["input_quantizers"]
         obj.framework = metadata["framework"]
-        obj._tree_inference, obj.output_quantizers, obj.onnx_model_ = tree_to_numpy(
+        obj.onnx_model_ = metadata["onnx_model_"]
+        obj.output_quantizers = metadata["output_quantizers"]
+        obj._fhe_ensembling = metadata["_fhe_ensembling"]
+        obj._tree_inference = tree_to_numpy(
             obj.sklearn_model,
             numpy.zeros((len(obj.input_quantizers),))[None, ...],
             framework=obj.framework,
-            output_n_bits=obj.n_bits,
-        )
+            output_n_bits=obj.n_bits["op_leaves"] if isinstance(obj.n_bits, Dict) else obj.n_bits,
+            fhe_ensembling=obj._fhe_ensembling,
+        )[0]
         obj.post_processing_params = metadata["post_processing_params"]
 
         # Scikit-Learn
@@ -277,5 +295,6 @@ class RandomForestRegressor(BaseTreeRegressorMixin):
         obj.max_leaf_nodes = metadata["max_leaf_nodes"]
         obj.min_impurity_decrease = metadata["min_impurity_decrease"]
         obj.ccp_alpha = metadata["ccp_alpha"]
+        obj.monotonic_cst = metadata["monotonic_cst"]
 
         return obj

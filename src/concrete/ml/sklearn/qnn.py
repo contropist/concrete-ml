@@ -141,7 +141,8 @@ class NeuralNetRegressor(QuantizedTorchEstimatorMixin, skorch.regressor.NeuralNe
         virtual_params = kwargs.pop("virtual_params_", {})
 
         self._kwargs = kwargs
-        vars(self).update(kwargs)
+        for key, value in kwargs.items():
+            setattr(self, key, value)
 
         self.history_ = history
         self.initialized_ = initialized
@@ -227,7 +228,7 @@ class NeuralNetRegressor(QuantizedTorchEstimatorMixin, skorch.regressor.NeuralNe
                 metadata["optimizer"] = optimizer.getvalue().hex()
                 metadata["criterion"] = criterion.getvalue().hex()
 
-        # Concrete-ML
+        # Concrete ML
         metadata["_is_fitted"] = self._is_fitted
         metadata["_is_compiled"] = self._is_compiled
         metadata["input_quantizers"] = self.input_quantizers
@@ -313,7 +314,7 @@ class NeuralNetRegressor(QuantizedTorchEstimatorMixin, skorch.regressor.NeuralNe
             module__n_layers=metadata["module__n_layers"],
         )
 
-        # Concrete-ML
+        # Concrete ML
         obj._is_fitted = metadata["_is_fitted"]
         obj._is_compiled = metadata["_is_compiled"]
         obj.input_quantizers = metadata["input_quantizers"]
@@ -448,7 +449,8 @@ class NeuralNetClassifier(
         virtual_params = kwargs.pop("virtual_params_", {})
 
         self._kwargs = kwargs
-        vars(self).update(kwargs)
+        for key, value in kwargs.items():
+            setattr(self, key, value)
 
         self.history_ = history
         self.initialized_ = initialized
@@ -538,7 +540,7 @@ class NeuralNetClassifier(
                 metadata["optimizer"] = optimizer.getvalue().hex()
                 metadata["criterion"] = criterion.getvalue().hex()
 
-        # Concrete-ML
+        # Concrete ML
         metadata["_is_fitted"] = self._is_fitted
         metadata["_is_compiled"] = self._is_compiled
         metadata["input_quantizers"] = self.input_quantizers
@@ -626,7 +628,7 @@ class NeuralNetClassifier(
             classes=metadata["classes_"],
         )
 
-        # Concrete-ML
+        # Concrete ML
         obj._is_fitted = metadata["_is_fitted"]
         obj._is_compiled = metadata["_is_compiled"]
         obj.input_quantizers = metadata["input_quantizers"]

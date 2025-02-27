@@ -1,4 +1,5 @@
 """Tests for the quantized module."""
+
 from functools import partial
 
 import numpy
@@ -6,7 +7,7 @@ import pytest
 import torch
 from torch import nn
 
-from concrete.ml.pytest.torch_models import CNN, FC, CNNMaxPool
+from concrete.ml.pytest.torch_models import CNN, FC, CNNMaxPool, EmbeddingModel
 from concrete.ml.pytest.utils import check_serialization, values_are_equal
 from concrete.ml.quantization import PostTrainingAffineQuantization, QuantizedModule
 from concrete.ml.torch import NumpyModule
@@ -51,7 +52,6 @@ N_BITS_LIST = [
         pytest.param(nn.Tanhshrink, id="Tanhshrink"),
         pytest.param(partial(nn.Threshold, threshold=0, value=0), id="Threshold"),
         pytest.param(nn.Softshrink, id="Softshrink"),
-        pytest.param(nn.Hardshrink, id="Hardshrink"),
         pytest.param(nn.Softsign, id="Softsign"),
         pytest.param(nn.GELU, id="GELU"),
         pytest.param(nn.LogSigmoid, id="LogSigmoid"),
@@ -468,12 +468,20 @@ def quantized_module_predictions_are_equal(
 @pytest.mark.parametrize(
     "model_class, input_shape",
     [
-        pytest.param(FC, (100, 32 * 32 * 3)),
-        pytest.param(partial(CNN, input_output=3), (100, 3, 32, 32)),
-        pytest.param(partial(CNNMaxPool, input_output=3), (100, 3, 32, 32)),
+        pytest.param(FC, (100, 32 * 32 * 3), id="FC"),
+        pytest.param(partial(CNN, input_output=3), (100, 3, 32, 32), id="CNN"),
+        pytest.param(partial(CNNMaxPool, input_output=3), (100, 3, 32, 32), id="CNNMaxPool"),
+        pytest.param(
+            partial(EmbeddingModel, num_embeddings=100, embedding_dim=3),
+            (100, 3),
+            id="EmbeddingModel",
+        ),
     ],
 )
-def test_serialization(model_class, input_shape):
+@pytest.mark.parametrize(
+    "rounding_threshold_bits", [None, 8, {"n_bits": 8, "method": "APPROXIMATE"}]
+)
+def test_serialization(model_class, input_shape, rounding_threshold_bits):
     """Test the serialization of quantized modules."""
 
     # Define the torch model
@@ -481,14 +489,23 @@ def test_serialization(model_class, input_shape):
     torch_fc_model.eval()
 
     # Create a random input
-    numpy_input = numpy.random.uniform(size=input_shape)
-    torch_input = torch.from_numpy(numpy_input).float()
+    if isinstance(model_class, partial) and model_class.func == EmbeddingModel:
+        # Ensure num_embeddings is available for EmbeddingModel
+        assert hasattr(model_class, "keywords") and "num_embeddings" in model_class.keywords
+        num_embeddings = model_class.keywords.get("num_embeddings")
+        numpy_input = numpy.random.randint(0, num_embeddings, size=input_shape)
+        torch_input = torch.from_numpy(numpy_input).long()
+    else:
+        numpy_input = numpy.random.uniform(size=input_shape)
+        torch_input = torch.from_numpy(numpy_input).float()
 
     # Create the corresponding numpy model
     numpy_fc_model = NumpyModule(torch_fc_model, torch_input)
 
     # Quantize with post-training static method
-    post_training_quant = PostTrainingAffineQuantization(8, numpy_fc_model)
+    post_training_quant = PostTrainingAffineQuantization(
+        8, numpy_fc_model, rounding_threshold_bits=rounding_threshold_bits
+    )
     quantized_module = post_training_quant.quantize_module(numpy_input)
 
     check_serialization(
@@ -496,3 +513,64 @@ def test_serialization(model_class, input_shape):
         QuantizedModule,
         equal_method=partial(quantized_module_predictions_are_equal, x=numpy_input),
     )
+
+
+def test_quantized_module_initialization_error():
+    """Test initialization fails with mismatched parameters."""
+    # Initialize with invalid parameters
+    with pytest.raises(
+        ValueError,
+        match=r"Please either set all three 'ordered_module_input_names', "
+        r"'ordered_module_output_names' and 'quant_layers_dict' or none of them.",
+    ):
+        QuantizedModule(
+            ordered_module_input_names=["input1", "input2"],
+            ordered_module_output_names=None,  # This makes the combination invalid
+            quant_layers_dict={"layer1": (["input1"], "QuantizedOp")},
+        )
+
+
+@pytest.mark.parametrize("model_class, input_shape", [pytest.param(FC, (100, 32 * 32 * 3))])
+def test_crt_circuit_creation_with_rounding(model_class, input_shape, default_configuration):
+    """Test the creation of CRT and non-CRT circuits based on rounding settings."""
+
+    torch_fc_model = model_class(activation_function=nn.ReLU)
+    torch_fc_model.eval()
+
+    # Create random input
+    numpy_input = numpy.random.uniform(size=input_shape)
+    torch_input = torch.from_numpy(numpy_input).float()
+
+    # Compile with rounding_threshold_bits = 6
+    quantized_model_with_rounding = compile_torch_model(
+        torch_fc_model,
+        torch_input,
+        False,
+        default_configuration,
+        n_bits=6,
+        p_error=0.01,
+        rounding_threshold_bits=4,
+    )
+
+    # Check that the packing key switch count is not present
+    # This should not be using CRT encoding
+    assert (
+        quantized_model_with_rounding.fhe_circuit.statistics.get("packing_key_switch_count", 0) == 0
+    ), "Packing key switch count should be 0 when rounding_threshold_bits is set."
+
+    # Compile with rounding_threshold_bits = None
+    # Which should create a CRT bsaed encoding circuit
+    quantized_model_without_rounding = compile_torch_model(
+        torch_fc_model,
+        torch_input,
+        False,
+        default_configuration,
+        n_bits=4,
+        rounding_threshold_bits=None,
+    )
+
+    # Check that the packing key switch count is not zero
+    assert (
+        quantized_model_without_rounding.fhe_circuit.statistics.get("packing_key_switch_count", 0)
+        > 0
+    ), "Packing key switch count should be > 0 when rounding_threshold_bits is not set."

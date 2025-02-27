@@ -1,10 +1,13 @@
 """Implements XGBoost models."""
+
 import platform
 import warnings
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Union
 
 import numpy
 import xgboost.sklearn
+from numpy.random import RandomState
+from xgboost.callback import TrainingCallback
 
 from ..common.debugging.custom_assert import assert_true
 from ..sklearn.tree_to_numpy import tree_to_numpy
@@ -27,9 +30,9 @@ class XGBClassifier(BaseTreeClassifierMixin):
     # pylint: disable=too-many-arguments,too-many-locals
     def __init__(
         self,
-        n_bits: int = 6,
+        n_bits: Union[int, Dict[str, int]] = 6,
         max_depth: Optional[int] = 3,
-        learning_rate: Optional[float] = 0.1,
+        learning_rate: Optional[float] = None,
         n_estimators: Optional[int] = 20,
         objective: Optional[str] = "binary:logistic",
         booster: Optional[str] = None,
@@ -49,7 +52,7 @@ class XGBClassifier(BaseTreeClassifierMixin):
         missing: float = numpy.nan,
         num_parallel_tree: Optional[int] = None,
         monotone_constraints: Optional[Union[Dict[str, int], str]] = None,
-        interaction_constraints: Optional[Union[str, List[Tuple[str]]]] = None,
+        interaction_constraints: Optional[Union[str, Sequence[Sequence[str]]]] = None,
         importance_type: Optional[str] = None,
         gpu_id: Optional[int] = None,
         validate_parameters: Optional[bool] = None,
@@ -58,6 +61,15 @@ class XGBClassifier(BaseTreeClassifierMixin):
         use_label_encoder: bool = False,
         random_state: Optional[int] = None,
         verbosity: Optional[int] = None,
+        max_bin: Optional[int] = None,
+        callbacks: Optional[List[TrainingCallback]] = None,
+        early_stopping_rounds: Optional[int] = None,
+        max_leaves: Optional[int] = None,
+        eval_metric: Optional[Union[str, List[str], Callable]] = None,
+        max_cat_to_onehot: Optional[int] = None,
+        grow_policy: Optional[str] = None,
+        sampling_method: Optional[str] = None,
+        **kwargs,
     ):
         # base_score != 0.5 or None does not seem to not pass our tests
         # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/474
@@ -111,11 +123,21 @@ class XGBClassifier(BaseTreeClassifierMixin):
         self.use_label_encoder = use_label_encoder
         self.random_state = random_state
         self.verbosity = verbosity
+        self.max_bin = max_bin
+        self.callbacks = callbacks
+        self.early_stopping_rounds = early_stopping_rounds
+        self.max_leaves = max_leaves
+        self.eval_metric = eval_metric
+        self.max_cat_to_onehot = max_cat_to_onehot
+        self.grow_policy = grow_policy
+        self.sampling_method = sampling_method
+        self.kwargs = kwargs
 
+    # pylint: disable=too-many-statements
     def dump_dict(self) -> Dict[str, Any]:
         metadata: Dict[str, Any] = {}
 
-        # Concrete-ML
+        # Concrete ML
         metadata["n_bits"] = self.n_bits
         metadata["sklearn_model"] = self.sklearn_model
         metadata["_is_fitted"] = self._is_fitted
@@ -125,6 +147,7 @@ class XGBClassifier(BaseTreeClassifierMixin):
         metadata["onnx_model_"] = self.onnx_model_
         metadata["framework"] = self.framework
         metadata["post_processing_params"] = self.post_processing_params
+        metadata["_fhe_ensembling"] = self._fhe_ensembling
 
         # XGBoost
         metadata["max_depth"] = self.max_depth
@@ -157,6 +180,25 @@ class XGBClassifier(BaseTreeClassifierMixin):
         metadata["use_label_encoder"] = self.use_label_encoder
         metadata["random_state"] = self.random_state
         metadata["verbosity"] = self.verbosity
+        metadata["max_bin"] = self.max_bin
+        metadata["early_stopping_rounds"] = self.early_stopping_rounds
+        metadata["max_leaves"] = self.max_leaves
+        metadata["max_cat_to_onehot"] = self.max_cat_to_onehot
+        metadata["grow_policy"] = self.grow_policy
+        metadata["sampling_method"] = self.sampling_method
+
+        if callable(self.eval_metric):
+            raise NotImplementedError("Callable eval_metric is not supported for serialization")
+
+        if self.kwargs:
+            raise NotImplementedError("kwargs are not supported for serialization")
+
+        if self.callbacks:
+            raise NotImplementedError("callbacks are not supported for serialization")
+
+        metadata["eval_metric"] = self.eval_metric
+        metadata["kwargs"] = None
+        metadata["callbacks"] = None
 
         return metadata
 
@@ -166,18 +208,26 @@ class XGBClassifier(BaseTreeClassifierMixin):
         # Instantiate the model
         obj = XGBClassifier(n_bits=metadata["n_bits"])
 
-        # Concrete-ML
+        # Concrete ML
         obj.sklearn_model = metadata["sklearn_model"]
         obj._is_fitted = metadata["_is_fitted"]
         obj._is_compiled = metadata["_is_compiled"]
         obj.input_quantizers = metadata["input_quantizers"]
         obj.framework = metadata["framework"]
-        obj._tree_inference, obj.output_quantizers, obj.onnx_model_ = tree_to_numpy(
+        obj.onnx_model_ = metadata["onnx_model_"]
+        obj.output_quantizers = metadata["output_quantizers"]
+        obj._fhe_ensembling = metadata["_fhe_ensembling"]
+
+        # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4545
+        # Execute with 2 example for efficiency in large data scenarios to prevent slowdown
+        # but also to work around the HB export issue.
+        obj._tree_inference = tree_to_numpy(
             obj.sklearn_model,
-            numpy.zeros((len(obj.input_quantizers),))[None, ...],
+            numpy.tile(numpy.zeros((len(obj.input_quantizers),))[None, ...], [2, 1]),
             framework=obj.framework,
-            output_n_bits=obj.n_bits,
-        )
+            output_n_bits=obj.n_bits["op_leaves"] if isinstance(obj.n_bits, Dict) else obj.n_bits,
+            fhe_ensembling=obj._fhe_ensembling,
+        )[0]
         obj.post_processing_params = metadata["post_processing_params"]
 
         # XGBoost
@@ -211,6 +261,14 @@ class XGBClassifier(BaseTreeClassifierMixin):
         obj.use_label_encoder = metadata["use_label_encoder"]
         obj.random_state = metadata["random_state"]
         obj.verbosity = metadata["verbosity"]
+        obj.max_bin = metadata["max_bin"]
+        obj.callbacks = metadata["callbacks"]
+        obj.early_stopping_rounds = metadata["early_stopping_rounds"]
+        obj.max_leaves = metadata["max_leaves"]
+        obj.eval_metric = metadata["eval_metric"]
+        obj.max_cat_to_onehot = metadata["max_cat_to_onehot"]
+        obj.grow_policy = metadata["grow_policy"]
+        obj.sampling_method = metadata["sampling_method"]
 
         return obj
 
@@ -231,10 +289,10 @@ class XGBRegressor(BaseTreeRegressorMixin):
     # pylint: disable=too-many-arguments,too-many-locals
     def __init__(
         self,
-        n_bits: int = 6,
+        n_bits: Union[int, Dict[str, int]] = 6,
         max_depth: Optional[int] = 3,
-        learning_rate: Optional[float] = 0.1,
-        n_estimators: Optional[int] = 20,
+        learning_rate: Optional[float] = None,
+        n_estimators: int = 20,
         objective: Optional[str] = "reg:squarederror",
         booster: Optional[str] = None,
         tree_method: Optional[str] = None,
@@ -253,15 +311,23 @@ class XGBRegressor(BaseTreeRegressorMixin):
         missing: float = numpy.nan,
         num_parallel_tree: Optional[int] = None,
         monotone_constraints: Optional[Union[Dict[str, int], str]] = None,
-        interaction_constraints: Optional[Union[str, List[Tuple[str]]]] = None,
+        interaction_constraints: Optional[Union[str, Sequence[Sequence[str]]]] = None,
         importance_type: Optional[str] = None,
         gpu_id: Optional[int] = None,
         validate_parameters: Optional[bool] = None,
         predictor: Optional[str] = None,
         enable_categorical: bool = False,
-        use_label_encoder: bool = False,
-        random_state: Optional[int] = None,
+        random_state: Optional[Union[RandomState, int]] = None,
         verbosity: Optional[int] = None,
+        eval_metric: Optional[Union[str, List[str], Callable]] = None,
+        sampling_method: Optional[str] = None,
+        max_leaves: Optional[int] = None,
+        max_bin: Optional[int] = None,
+        max_cat_to_onehot: Optional[int] = None,
+        grow_policy: Optional[str] = None,
+        callbacks: Optional[List[TrainingCallback]] = None,
+        early_stopping_rounds: Optional[int] = None,
+        **kwargs: Any,
     ):
         # base_score != 0.5 or None does not seem to not pass our tests
         # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/474
@@ -312,9 +378,17 @@ class XGBRegressor(BaseTreeRegressorMixin):
         self.validate_parameters = validate_parameters
         self.predictor = predictor
         self.enable_categorical = enable_categorical
-        self.use_label_encoder = use_label_encoder
         self.random_state = random_state
         self.verbosity = verbosity
+        self.max_bin = max_bin
+        self.max_leaves = max_leaves
+        self.max_cat_to_onehot = max_cat_to_onehot
+        self.grow_policy = grow_policy
+        self.sampling_method = sampling_method
+        self.callbacks = callbacks
+        self.early_stopping_rounds = early_stopping_rounds
+        self.eval_metric = eval_metric
+        self.kwargs = kwargs
 
     def fit(self, X, y, *args, **kwargs) -> Any:
 
@@ -339,10 +413,11 @@ class XGBRegressor(BaseTreeRegressorMixin):
         y_preds += 0.5
         return y_preds
 
+    # pylint: disable=too-many-statements
     def dump_dict(self) -> Dict[str, Any]:
         metadata: Dict[str, Any] = {}
 
-        # Concrete-ML
+        # Concrete ML
         metadata["n_bits"] = self.n_bits
         metadata["sklearn_model"] = self.sklearn_model
         metadata["_is_fitted"] = self._is_fitted
@@ -352,6 +427,7 @@ class XGBRegressor(BaseTreeRegressorMixin):
         metadata["onnx_model_"] = self.onnx_model_
         metadata["framework"] = self.framework
         metadata["post_processing_params"] = self.post_processing_params
+        metadata["_fhe_ensembling"] = self._fhe_ensembling
 
         # XGBoost
         metadata["max_depth"] = self.max_depth
@@ -381,9 +457,27 @@ class XGBRegressor(BaseTreeRegressorMixin):
         metadata["validate_parameters"] = self.validate_parameters
         metadata["predictor"] = self.predictor
         metadata["enable_categorical"] = self.enable_categorical
-        metadata["use_label_encoder"] = self.use_label_encoder
         metadata["random_state"] = self.random_state
         metadata["verbosity"] = self.verbosity
+        metadata["max_bin"] = self.max_bin
+        metadata["max_leaves"] = self.max_leaves
+        metadata["max_cat_to_onehot"] = self.max_cat_to_onehot
+        metadata["grow_policy"] = self.grow_policy
+        metadata["sampling_method"] = self.sampling_method
+        metadata["early_stopping_rounds"] = self.early_stopping_rounds
+
+        if callable(self.eval_metric):
+            raise NotImplementedError("Callable eval_metric is not supported for serialization")
+
+        if self.kwargs:
+            raise NotImplementedError("kwargs are not supported for serialization")
+
+        if self.callbacks:
+            raise NotImplementedError("callbacks are not supported for serialization")
+
+        metadata["eval_metric"] = self.eval_metric
+        metadata["kwargs"] = None
+        metadata["callbacks"] = None
 
         return metadata
 
@@ -393,18 +487,26 @@ class XGBRegressor(BaseTreeRegressorMixin):
         # Instantiate the model
         obj = XGBRegressor(n_bits=metadata["n_bits"])
 
-        # Concrete-ML
+        # Concrete ML
         obj.sklearn_model = metadata["sklearn_model"]
         obj._is_fitted = metadata["_is_fitted"]
         obj._is_compiled = metadata["_is_compiled"]
         obj.input_quantizers = metadata["input_quantizers"]
         obj.framework = metadata["framework"]
-        obj._tree_inference, obj.output_quantizers, obj.onnx_model_ = tree_to_numpy(
+        obj.onnx_model_ = metadata["onnx_model_"]
+        obj.output_quantizers = metadata["output_quantizers"]
+        obj._fhe_ensembling = metadata["_fhe_ensembling"]
+
+        # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4545
+        # Execute with 2 example for efficiency in large data scenarios to prevent slowdown
+        # but also to work around the HB export issue.
+        obj._tree_inference = tree_to_numpy(
             obj.sklearn_model,
-            numpy.zeros((len(obj.input_quantizers),))[None, ...],
+            numpy.tile(numpy.zeros((len(obj.input_quantizers),))[None, ...], [2, 1]),
             framework=obj.framework,
-            output_n_bits=obj.n_bits,
-        )
+            output_n_bits=obj.n_bits["op_leaves"] if isinstance(obj.n_bits, Dict) else obj.n_bits,
+            fhe_ensembling=obj._fhe_ensembling,
+        )[0]
         obj.post_processing_params = metadata["post_processing_params"]
 
         # XGBoost
@@ -435,8 +537,16 @@ class XGBRegressor(BaseTreeRegressorMixin):
         obj.validate_parameters = metadata["validate_parameters"]
         obj.predictor = metadata["predictor"]
         obj.enable_categorical = metadata["enable_categorical"]
-        obj.use_label_encoder = metadata["use_label_encoder"]
         obj.random_state = metadata["random_state"]
         obj.verbosity = metadata["verbosity"]
+        obj.max_bin = metadata["max_bin"]
+        obj.max_leaves = metadata["max_leaves"]
+        obj.max_cat_to_onehot = metadata["max_cat_to_onehot"]
+        obj.grow_policy = metadata["grow_policy"]
+        obj.sampling_method = metadata["sampling_method"]
+        obj.callbacks = metadata["callbacks"]
+        obj.early_stopping_rounds = metadata["early_stopping_rounds"]
+        obj.eval_metric = metadata["eval_metric"]
+        obj.kwargs = metadata["kwargs"]
 
         return obj

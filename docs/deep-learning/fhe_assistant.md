@@ -1,15 +1,14 @@
-# Debugging Models
+# Debugging models
 
-This section provides a set of tools and guidelines to help users build optimized FHE-compatible models. It discusses
-FHE simulation, the key-cache functionality that helps speed-up FHE result debugging, and gives a guide to evaluate circuit complexity.
+This section provides a set of tools and guidelines to help users debug errors and build optimized models that are compatible with Fully Homomorphic Encryption (FHE).
 
 ## Simulation
 
-The [simulation functionality](../advanced-topics/compilation.md#fhe-simulation) of Concrete ML provides a way to evaluate, using clear data, the results that ML models produce on encrypted data. The simulation includes any probabilistic behavior FHE may induce. The simulation is implemented with [Concrete's simulation](https://docs.zama.ai/concrete/tutorials/simulation).
+The [simulation functionality](../explanations/compilation.md#fhe-simulation) of Concrete ML provides a way to evaluate, using clear data, the results that ML models produce on encrypted data. The simulation includes any probabilistic behavior FHE may induce. The simulation is implemented with [Concrete's simulation](https://docs.zama.ai/concrete/execution-analysis/simulation).
 
 The simulation mode can be useful when developing and iterating on an ML model implementation. As FHE non-linear models work with integers up to 16 bits, with a trade-off between the number of bits and the FHE execution speed, the simulation can help to find the optimal model design.
 
-Simulation is much faster than FHE execution. This allows for faster debugging and model optimization. For example, this was used for the red/blue contours in the [Classifier Comparison notebook](../built-in-models/ml_examples.md), as computing in FHE for the whole grid and all the classifiers would take significant time.
+Simulation is much faster than FHE execution. This allows for faster debugging and model optimization. For example, this was used for the red/blue contours in the [Classifier Comparison notebook](../tutorials/ml_examples.md), as computing in FHE for the whole grid and all the classifiers would take significant time.
 
 The following example shows how to use the simulation mode in Concrete ML.
 
@@ -32,8 +31,7 @@ y_preds_clear = concrete_clf.predict(X, fhe="simulate")
 
 ## Caching keys during debugging
 
-It is possible to avoid re-generating the keys of the models you are debugging. This feature is unsafe and
-should not be used in production. Here is an example that shows how to enable key-caching:
+It is possible to avoid re-generating the keys of the models you are debugging. This feature is unsafe and should not be used in production. Here is an example that shows how to enable key-caching:
 
 ```python
 from sklearn.datasets import fetch_openml, make_circles
@@ -55,117 +53,72 @@ concrete_clf.fit(X, y)
 concrete_clf.compile(X, debug_config)
 ```
 
-## Compilation debugging
+## Common compilation errors
 
-The following produces a neural network that is not FHE-compatible:
+#### 1. TLU input maximum bit-width is exceeded
 
-```python
-import numpy
-import torch
+**Error message**: `this [N]-bit value is used as an input to a table lookup`
 
-from torch import nn
-from concrete.ml.torch.compile import compile_torch_model
+**Cause**: This error can occur when `rounding_threshold_bits` is not used and accumulated intermediate values in the computation exceed 16 bits. To pinpoint the model layer that causes the error, Concrete ML provides the [bitwidth_and_range_report](../references/api/concrete.ml.quantization.quantized_module.md#method-bitwidth_and_range_report) helper function. To use this function, the model must be compiled first so that it can be [simulated](fhe_assistant.md#simulation).
 
-N_FEAT = 2
-class SimpleNet(nn.Module):
-    """Simple MLP with PyTorch"""
+**Possible solutions**:
 
-    def __init__(self, n_hidden=30):
-        super().__init__()
-        self.fc1 = nn.Linear(in_features=N_FEAT, out_features=n_hidden)
-        self.fc2 = nn.Linear(in_features=n_hidden, out_features=n_hidden)
-        self.fc3 = nn.Linear(in_features=n_hidden, out_features=2)
+- Reduce quantization `n_bits`. However, this may reduce accuracy. When quantization `n_bits` must be below 6, it is best to use [Quantization Aware Training](../deep-learning/fhe_friendly_models.md).
+- Use `rounding_threshold_bits`. This feature is described [here](../explanations/advanced_features.md#rounded-activations-and-quantizers). It is recommended to use the [`fhe.Exactness.APPROXIMATE`](../references/api/concrete.ml.torch.compile.md#function-compile_torch_model) setting, and set the rounding bits to 1 or 2 bits higher than the quantization `n_bits`
+- Use [pruning](../explanations/pruning.md)
 
+#### 2. No crypto-parameters can be found
 
-    def forward(self, x):
-        """Forward pass."""
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        x = self.fc3(x)
-        return x
+**Error message**: `RuntimeError: NoParametersFound`
 
+**Cause**: This error occurs when cryptosystem parameters can not be found for the model bit-width, rounding mode and requested `p_error`, when using `rounding_threshold_bits` in the `compile_torch_model` function. With `rounding_threshold_bits` set, the 16-bit accumulator limit is relaxed, so the `this [N]-bit value is used as an input to a table lookup` does not occur. However, cryptosystem-parameters may still not exist for the model to be compiled.
 
-torch_input = torch.randn(100, N_FEAT)
-torch_model = SimpleNet(120)
-try:
-    quantized_numpy_module = compile_torch_model(
-        torch_model,
-        torch_input,
-        n_bits=7,
-    )
-except RuntimeError as err:
-    print(err)
-```
+**Possible solutions**: The solutions in this case are similar to the ones for the previous error: reducing bit-width, or reducing the `rounding_threshold_bits`, or using the [`fhe.Exactness.APPROXIMATE`](../references/api/concrete.ml.torch.compile.md#function-compile_torch_model) rounding method can help. Additionally adjusting the tolerance for one-off errors using the `p_error` parameter can help, as explained in [this section](../explanations/advanced_features.md#approximate-computations).
 
-Upon execution, the Compiler will raise the following error within the graph representation:
+#### 3. Quantization import failed
 
-```
-Function you are trying to compile cannot be converted to MLIR:
+**Error message**: `Error occurred during quantization aware training (QAT) import [...] Are you missing a QuantIdentity layer in your Brevitas model?`.
 
-%0 = _onnx__Gemm_0                    # EncryptedTensor<int7, shape=(1, 2)>        ∈ [-64, 63]
-%1 = [[ 33 -27  ...   22 -29]]        # ClearTensor<int7, shape=(2, 120)>          ∈ [-63, 62]
-%2 = matmul(%0, %1)                   # EncryptedTensor<int14, shape=(1, 120)>     ∈ [-4973, 4828]
-%3 = subgraph(%2)                     # EncryptedTensor<uint7, shape=(1, 120)>     ∈ [0, 126]
-%4 = [[ 16   6  ...   10  54]]        # ClearTensor<int7, shape=(120, 120)>        ∈ [-63, 63]
-%5 = matmul(%3, %4)                   # EncryptedTensor<int17, shape=(1, 120)>     ∈ [-45632, 43208]
-%6 = subgraph(%5)                     # EncryptedTensor<uint7, shape=(1, 120)>     ∈ [0, 126]
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ table lookups are only supported on circuits with up to 16-bit integers
-%7 = [[ -7 -52] ... [-12  62]]        # ClearTensor<int7, shape=(120, 2)>          ∈ [-63, 62]
-%8 = matmul(%6, %7)                   # EncryptedTensor<int16, shape=(1, 2)>       ∈ [-26971, 29843]
-return %8
-```
+**Cause**: This error occurs when the model imported as a quantized-aware training model lacks quantization operators. See [this guide](../deep-learning/fhe_friendly_models.md) on how to use Brevitas layers. This error message indicates that some layers do not take inputs quantized through `QuantIdentity` layers.
 
-The error `table lookups are only supported on circuits with up to 16-bit integers` indicates that the 16-bit limit on the input of the Table Lookup operation has been exceeded. To pinpoint the model layer that causes the error, Concrete ML provides the [bitwidth_and_range_report](../developer-guide/api/concrete.ml.quantization.quantized_module.md#method-bitwidth_and_range_report) helper function. First, the model must be compiled so that it can be [simulated](#simulation). Then, calling the function on the module above returns the following:
+A common example is related to the concatenation operator. Suppose two tensors `x` and `y` are produced by two layers and need to be concatenated:
 
-```
-quantized_numpy_module = compile_torch_model(
-    torch_model,
-    torch_input,
-    n_bits=7,
-    use_virtual_lib=True
-)
-
-res = quantized_numpy_module.bitwidth_and_range_report()
-print(res)
-```
-
-```
-{
-    '/fc1/Gemm': {'range': (-6180, 6840), 'bitwidth': 14}, 
-    '/fc2/Gemm': {'range': (-45051, 43090), 'bitwidth': 17}, 
-    '/fc3/Gemm': {'range': (-17351, 13868), 'bitwidth': 16}
-}
-```
-
-To make this network FHE-compatible one can reduce the bit-width of the second layer named `fc2`. To do this, a simple solution is to reduce the number of neurons, as it is proportional to the bit-width.
-
-Reducing the number of neurons in this layer resolves the error and makes the network FHE-compatible:
-
-<!--pytest-codeblocks:cont-->
+<!--pytest-codeblocks:skip-->
 
 ```python
-torch_model = SimpleNet(10)
-
-quantized_numpy_module = compile_torch_model(
-    torch_model,
-    torch_input,
-    n_bits=7,
-)
+x = self.dense1(x)
+y = self.dense2(y)
+z = torch.cat([x, y])
 ```
 
-## Complexity analysis
+In the example above, the `x` and `y` layers need quantization before being concatenated.
 
-In FHE, univariate functions are encoded as table lookups, which are then implemented using Programmable Bootstrapping (PBS). PBS is a powerful technique but will require significantly more computing resources, and thus time, compared to simpler encrypted operations such as matrix multiplications, convolution, or additions.
+**Possible solutions**:
 
-Furthermore, the cost of PBS will depend on the bit-width of the compiled circuit. Every additional bit in the maximum bit-width raises the complexity of the PBS by a significant factor. It may be of interest to the model developer, then, to determine the bit-width of the circuit and the amount of PBS it performs.
+1. If the error occurs for the first layer of the model: Add a  `QuantIdentity` layer in your model and apply it on the input of the `forward` function, before the first layer is computed.
+1. If the error occurs for a concatenation or addition layer: Add a new `QuantIdentity` layer in your model. Suppose it is called `quant_concat`. In the `forward` function, before concatenation of `x` and `y`, apply it to both tensors that are concatenated. The usage of a common `Quantidentity` layer to quantize both tensors that are concatenated ensures that they have the same scale:
 
-This can be done by inspecting the MLIR code produced by the Compiler:
+<!--pytest-codeblocks:skip-->
 
-<!--pytest-codeblocks:cont-->
+```python
+z = torch.cat([self.quant_concat(x), self.quant_concat(y)])
+```
+
+## PBS complexity and optimization
+
+In FHE, univariate functions are encoded as Table Lookups, which are then implemented using [Programmable Bootstrapping (PBS)](../getting-started/concepts.md#cryptography-concepts). PBS is a powerful technique but requires significantly more computing resources compared to simpler encrypted operations such as matrix multiplications, convolution, or additions.
+
+Furthermore, the cost of PBS depends on the bit-width of the compiled circuit. Every additional bit in the maximum bit-width significantly increase the complexity of the PBS. Therefore, it is important to determine the bit-width of the circuit and the amount of PBS it performs in order to optimize the performance.
+
+To inspect the MLIR code produced by the compiler, use the following command:
+
+<!--pytest-codeblocks:skip-->
 
 ```python
 print(quantized_numpy_module.fhe_circuit.mlir)
 ```
+
+Example output:
 
 ```
 MLIR
@@ -201,14 +154,14 @@ module {
 --------------------------------------------------------------------------------
 ```
 
-There are several calls to `FHELinalg.apply_mapped_lookup_table` and `FHELinalg.apply_lookup_table`. These calls apply PBS to the cells of their input tensors. Their inputs in the listing above are: `tensor<1x2x!FHE.eint<8>>` for the first and last call and `tensor<1x50x!FHE.eint<8>>` for the two calls in the middle. Thus, PBS is applied 104 times.
+In the MLIR code, there are several calls to `FHELinalg.apply_mapped_lookup_table` and `FHELinalg.apply_lookup_table`. These calls apply PBS to the cells of their input tensors. For example, in the code above, the inputs are: `tensor<1x5x!FHE.eint<15>>` for both the first and last `apply_mapped_lookup_table` call. Thus, the PBS is applied 10 times, corresponding to the size of every encrypted tensor, which is 1x5 multiplied by 2.
 
-Retrieving the bit-width of the circuit is then simply:
+To retrieve the bit-width of the circuit, use this command:
 
-<!--pytest-codeblocks:cont-->
+<!--pytest-codeblocks:skip-->
 
 ```python
 print(quantized_numpy_module.fhe_circuit.graph.maximum_integer_bit_width())
 ```
 
-Decreasing the number of bits and the number of PBS applications induces large reductions in the computation time of the compiled circuit.
+Reducing the number of bits and the number of PBS applications can significantly decrease the computation time of the compiled circuit.

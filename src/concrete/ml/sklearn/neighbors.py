@@ -1,4 +1,5 @@
 """Implement sklearn neighbors model."""
+
 from typing import Any, Dict, Union
 
 import numpy
@@ -96,7 +97,7 @@ class KNeighborsClassifier(SklearnKNeighborsClassifierMixin):
         # Instantiate the model
         obj = cls(n_bits=metadata["n_bits"])
 
-        # Concrete-ML
+        # Concrete ML
         obj.sklearn_model = metadata["sklearn_model"]
         obj._is_fitted = metadata["_is_fitted"]
         obj._is_compiled = metadata["_is_compiled"]

@@ -1,4 +1,5 @@
 """Custom decoder for serialization."""
+
 import inspect
 import json
 from typing import Any, Dict, Type
@@ -9,6 +10,7 @@ import torch
 from numpy.random import RandomState
 from skorch.dataset import ValidSplit
 
+from ...common.utils import Exactness
 from ...quantization.base_quantized_op import ALL_QUANTIZED_OPS
 from ...quantization.quantized_module import QuantizedModule
 from ...quantization.quantizers import (
@@ -90,6 +92,10 @@ TRUSTED_SKOPS = (
         "sklearn.neighbors._classification.KNeighborsClassifier",
         "sklearn.metrics._dist_metrics.EuclideanDistance",
         "sklearn.neighbors._kd_tree.KDTree",
+        "_loss.CyHalfTweedieLossIdentity",
+        "_loss.CyHalfTweedieLoss",
+        "_loss.CyHalfPoissonLoss",
+        "_loss.CyHalfGammaLoss",
     ]
 )
 
@@ -200,6 +206,9 @@ def object_hook(d: Any) -> Any:
             SERIALIZABLE_CLASSES = {
                 model_class.__name__: model_class for model_class in serializable_classes
             }
+
+        if type_name == "Exactness":
+            return Exactness(serialized_value)
 
         # If the value reaches this point and the initial object was properly serialized, we
         # expect it to be a class from Concrete ML that implements a `load_dict` method

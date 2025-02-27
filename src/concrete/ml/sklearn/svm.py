@@ -1,4 +1,5 @@
 """Implement Support Vector Machine."""
+
 from typing import Any, Dict
 
 import sklearn.svm
@@ -60,7 +61,7 @@ class LinearSVR(SklearnLinearRegressorMixin):
 
         metadata: Dict[str, Any] = {}
 
-        # Concrete-ML
+        # Concrete ML
         metadata["n_bits"] = self.n_bits
         metadata["sklearn_model"] = self.sklearn_model
         metadata["_is_fitted"] = self._is_fitted
@@ -93,7 +94,7 @@ class LinearSVR(SklearnLinearRegressorMixin):
         # Instantiate the model
         obj = LinearSVR()
 
-        # Concrete-ML
+        # Concrete ML
         obj.n_bits = metadata["n_bits"]
         obj.sklearn_model = metadata["sklearn_model"]
         obj._is_fitted = metadata["_is_fitted"]
@@ -179,7 +180,7 @@ class LinearSVC(SklearnLinearClassifierMixin):
 
         metadata: Dict[str, Any] = {}
 
-        # Concrete-ML
+        # Concrete ML
         metadata["n_bits"] = self.n_bits
         metadata["sklearn_model"] = self.sklearn_model
         metadata["_is_fitted"] = self._is_fitted
@@ -214,7 +215,7 @@ class LinearSVC(SklearnLinearClassifierMixin):
         # Instantiate the model
         obj = LinearSVC()
 
-        # Concrete-ML
+        # Concrete ML
         obj.n_bits = metadata["n_bits"]
         obj.sklearn_model = metadata["sklearn_model"]
         obj._is_fitted = metadata["_is_fitted"]

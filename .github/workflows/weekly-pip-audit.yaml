@@ -33,7 +33,6 @@ jobs:
     timeout-minutes: 5
     env:
       PIP_INDEX_URL: ${{ secrets.PIP_INDEX_URL }}
-      PIP_EXTRA_INDEX_URL: ${{ secrets.PIP_EXTRA_INDEX_URL }}
     steps:
       - name: Add masks
         run: |
@@ -41,10 +40,10 @@ jobs:
           echo "::add-mask::${{ secrets.INTERNAL_REPO_URL_FOR_MASK }}"
 
       - name: Checkout Code
-        uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Set up Python 3.8
-        uses: actions/setup-python@65d7f2d534ac1bc67fcd62888c5f4f3d2cb2b236
+        uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b
         with:
           python-version: '3.8'
 
@@ -62,7 +61,7 @@ jobs:
           which pip3
 
           python -m pip install --upgrade pip
-          python -m pip install poetry
+          python -m pip install poetry==1.8.4
           make setup_env
 
       - name: Run pip-audit
@@ -97,7 +96,7 @@ jobs:
       - name: Slack Notification
         if: ${{ always() && !success() }}
         continue-on-error: true
-        uses: rtCamp/action-slack-notify@b24d75fe0e728a4bf9fc42ee217caa686d141ee8
+        uses: rtCamp/action-slack-notify@c33737706dea87cd7784c687dadc9adf1be59990
         env:
           SLACK_CHANNEL: ${{ secrets.SLACK_CHANNEL }}
           SLACK_ICON: https://pbs.twimg.com/profile_images/1274014582265298945/OjBKP9kn_400x400.png

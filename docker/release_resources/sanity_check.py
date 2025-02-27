@@ -1,4 +1,5 @@
 """Sanity checks, to be sure that our package is usable"""
+
 import argparse
 import random
 import shutil
@@ -74,6 +75,7 @@ def ml_check(args, keyring_dir_as_str):
         enable_unsafe_features=True,
         use_insecure_key_cache=is_fast,
         insecure_key_cache_location=keyring_dir_as_str,
+        compress_input_ciphertexts=True,
     )
 
     # We first compile the model with some data, here the training set
@@ -92,7 +94,7 @@ def ml_check(args, keyring_dir_as_str):
     print(f"Prediction sklearn       : {y_pred[:nb_samples]}")
 
     print(
-        f"{numpy.sum(y_pred_simulated==y_pred[:nb_samples])}/{nb_samples} "
+        f"{numpy.sum(y_pred_simulated == y_pred[:nb_samples])}/{nb_samples} "
         "predictions are similar between the FHE simulated model and the clear sklearn model."
     )
 
@@ -119,6 +121,8 @@ def cn_check(args, keyring_dir_as_str):
         enable_unsafe_features=is_fast,
         use_insecure_key_cache=is_fast,
         insecure_key_cache_location=keyring_dir_as_str,
+        compress_input_ciphertexts=True,
+        compress_evaluation_keys=True,
     )
 
     print("Compiling...")
@@ -153,7 +157,7 @@ def main(args):
 
     keyring_dir_as_str = None
     if is_fast:
-        keyring_dir = Path.home().resolve() / "ConcreteNumpyKeyCache"
+        keyring_dir = Path.home().resolve() / "ConcretePythonKeyCache"
         keyring_dir.mkdir(parents=True, exist_ok=True)
         keyring_dir_as_str = str(keyring_dir)
         print(f"Using {keyring_dir_as_str} as key cache dir")
@@ -162,7 +166,7 @@ def main(args):
     cn_check(args, keyring_dir_as_str)
 
     if is_fast:
-        keyring_dir = Path.home().resolve() / "ConcreteNumpyKeyCache"
+        keyring_dir = Path.home().resolve() / "ConcretePythonKeyCache"
         if keyring_dir is not None:
             # Remove incomplete keys
             for incomplete_keys in keyring_dir.glob("**/*incomplete*"):

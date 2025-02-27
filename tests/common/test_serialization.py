@@ -3,9 +3,9 @@
 Here we test the custom dump(s)/load(s) functions for all supported objects. We also check that
 serializing unsupported object types properly throws an error.
 """
+
 import inspect
 import io
-import warnings
 from functools import partial
 
 import numpy
@@ -17,7 +17,6 @@ import torch
 from concrete.fhe.compilation import Circuit
 from numpy.random import RandomState
 from sklearn.datasets import make_regression
-from sklearn.exceptions import ConvergenceWarning
 from skops.io.exceptions import UntrustedTypesFoundException
 from skorch.dataset import ValidSplit
 from torch import nn
@@ -116,15 +115,23 @@ def test_serialize_random_state(random_state, random_state_type):
 )
 def test_serialize_sklearn_model(concrete_model_class, load_data):
     """Test serialization of sklearn_model objects."""
+
+    # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4694
+    # Skip test for regressors that use internal scikit-learn loss classes
+    problematic_models = {"TweedieRegressor", "GammaRegressor", "PoissonRegressor"}
+    if concrete_model_class.__name__ in problematic_models:
+        pytest.skip(
+            f"Skipping {concrete_model_class.__name__} due to internal scikit-learn "
+            "class serialization issues"
+        )
+
     # Create the data
     x, y = load_data(concrete_model_class)
 
     # Instantiate and fit a Concrete model to recover its underlying Scikit Learn model
     concrete_model = concrete_model_class()
 
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=ConvergenceWarning)
-        _, sklearn_model = concrete_model.fit_benchmark(x, y)
+    _, sklearn_model = concrete_model.fit_benchmark(x, y)
 
     # Both JSON string are not compared as scikit-learn models are serialized using Skops or pickle,
     # which does not make string comparison possible
@@ -221,7 +228,6 @@ def test_serialize_numpy_array(dtype):
 )
 def test_serialize_type(value):
     """Test serialization of type objects (trusted by Skops)."""
-    value = torch.nn.modules.activation.ReLU
 
     check_serialization(value, type, check_str=False)
 

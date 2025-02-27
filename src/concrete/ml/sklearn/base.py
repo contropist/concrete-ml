@@ -1,7 +1,10 @@
 """Base classes for all estimators."""
+
 from __future__ import annotations
 
 import copy
+import json
+import os
 import tempfile
 
 # Disable pylint as some names like X and q_X are used, following scikit-Learn's standard. The file
@@ -14,29 +17,39 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, TextIO, Type, Union
 
 import brevitas.nn as qnn
-import concrete.fhe as cnp
+
+# pylint: disable-next=ungrouped-imports
+import concrete.fhe as cp
+import concrete_ml_extensions as fhext
 import numpy
 import onnx
 import sklearn
 import skorch.net
 import torch
 from brevitas.export.onnx.qonnx.manager import QONNXManager as BrevitasONNXManager
+from concrete.fhe import tfhers
 from concrete.fhe.compilation.artifacts import DebugArtifacts
 from concrete.fhe.compilation.circuit import Circuit
 from concrete.fhe.compilation.compiler import Compiler
 from concrete.fhe.compilation.configuration import Configuration
 from concrete.fhe.dtypes.integer import Integer
 from sklearn.base import clone
+from sklearn.linear_model import LinearRegression, LogisticRegression
 from sklearn.utils.validation import check_is_fitted
+from xgboost.sklearn import XGBModel
 
 from ..common.check_inputs import check_array_and_assert, check_X_y_and_assert_multi_output
 from ..common.debugging.custom_assert import assert_true
 from ..common.serialization.dumpers import dump, dumps
 from ..common.utils import (
     USE_OLD_VL,
+    CiphertextFormat,
     FheMode,
+    check_compilation_device_is_valid_and_is_cuda,
+    check_execution_device_is_valid_and_is_cuda,
     check_there_is_no_p_error_options_in_configuration,
     generate_proxy_function,
+    is_classifier_or_partial_classifier,
     manage_parameters_for_pbs_errors,
 )
 from ..onnx.convert import OPSET_VERSION_FOR_ONNX_EXPORT
@@ -45,7 +58,13 @@ from ..onnx.onnx_model_manipulations import clean_graph_after_node_op_type, remo
 # The sigmoid and softmax functions are already defined in the ONNX module and thus are imported
 # here in order to avoid duplicating them.
 from ..onnx.ops_impl import numpy_sigmoid, numpy_softmax
-from ..quantization import PostTrainingQATImporter, QuantizedArray, get_n_bits_dict
+from ..quantization import (
+    PostTrainingQATImporter,
+    QuantizedArray,
+    _get_n_bits_dict_trees,
+    _inspect_tree_n_bits,
+    get_n_bits_dict,
+)
 from ..quantization.quantized_module import QuantizedModule, _get_inputset_generator
 from ..quantization.quantizers import (
     QuantizationOptions,
@@ -54,7 +73,13 @@ from ..quantization.quantizers import (
 )
 from ..torch import NumpyModule
 from .qnn_module import SparseQuantNeuralNetwork
-from .tree_to_numpy import tree_to_numpy
+from .tree_to_numpy import (
+    get_equivalent_numpy_forward_from_onnx_tree,
+    get_onnx_model,
+    is_regressor_or_partial_regressor,
+    onnx_fp32_model_to_quantized_model,
+    tree_to_numpy,
+)
 
 # Disable pylint to import Hummingbird while ignoring the warnings
 # pylint: disable=wrong-import-position,wrong-import-order
@@ -89,8 +114,13 @@ Target = Union[
 # Define QNN's attribute that will be auto-generated when fitting
 QNN_AUTO_KWARGS = ["module__n_outputs", "module__input_dim"]
 
+# Enable rounding feature for all tree-based models by default
+# Note: This setting is fixed and cannot be altered by users
+# However, for internal testing purposes, we retain the capability to disable this feature
+os.environ["TREES_USE_ROUNDING"] = os.environ.get("TREES_USE_ROUNDING", "1")
 
-# pylint: disable=too-many-public-methods
+
+# pylint: disable=too-many-public-methods, too-many-instance-attributes
 class BaseEstimator:
     """Base class for all estimators in Concrete ML.
 
@@ -140,8 +170,14 @@ class BaseEstimator:
         #: Indicate if the model is compiled.
         self._is_compiled: bool = False
 
+        self._compiled_for_cuda: bool = False
+
         self.fhe_circuit_: Optional[Circuit] = None
         self.onnx_model_: Optional[onnx.ModelProto] = None
+
+        self._tfhers_bridge: Optional[tfhers.bridge.Bridge] = None
+        self._ciphertext_format: Optional[CiphertextFormat] = None
+        self.tfhers_sk: Optional[bytes] = None
 
     def __getattr__(self, attr: str):
         """Get the model's attribute.
@@ -249,7 +285,7 @@ class BaseEstimator:
 
         The FHE circuit combines computational graph, mlir, client and server into a single object.
         More information available in Concrete documentation
-        (https://docs.zama.ai/concrete/getting-started/terminology_and_structure)
+        (https://docs.zama.ai/concrete/get-started/terminology)
         Is None if the model is not fitted.
 
         Returns:
@@ -329,8 +365,8 @@ class BaseEstimator:
         # Here, the `get_params` method is the `BaseEstimator.get_params` method from scikit-learn,
         # which will become available once a subclass inherits from it. We therefore disable both
         # pylint and mypy as this behavior is expected
-        # pylint: disable-next=no-member
         # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/3373
+        # pylint: disable-next=no-member
         params = super().get_params(deep=deep)  # type: ignore[misc]
 
         # Remove the n_bits parameters as this attribute is added by Concrete ML
@@ -478,15 +514,40 @@ class BaseEstimator:
             Union[Compiler, QuantizedModule]: The module instance to compile.
         """
 
+    def _get_tfhers_module_to_compile(self, inputset):
+        c = self._get_module_to_compile()
+        assert isinstance(c, Compiler)
+        graph = c.trace(inputset)
+
+        output_dtype = graph.ordered_outputs()[0].output.dtype
+        output_bitwidth = output_dtype.bit_width
+        output_signed = output_dtype.is_signed
+        crypto_params = json.loads(fhext.get_crypto_params_radix())  # pylint: disable=no-member
+        out_dtype_spec = tfhers.get_type_from_params_dict(  # pylint: disable=no-member
+            crypto_params, output_signed, output_bitwidth
+        )
+
+        native_function_to_compile = c._func_def.function  # pylint: disable=protected-access
+
+        def tfhers_tree_inference(inputs):
+            concrete_x = tfhers.to_native(inputs)
+            res = native_function_to_compile(concrete_x)
+            tfhers_res = tfhers.from_native(res[0], out_dtype_spec)
+            return tfhers_res
+
+        return Compiler(tfhers_tree_inference, {"inputs": "encrypted"})
+
     def compile(
         self,
         X: Data,
         configuration: Optional[Configuration] = None,
+        ciphertext_format: Union[str, CiphertextFormat] = CiphertextFormat.CONCRETE,
         artifacts: Optional[DebugArtifacts] = None,
         show_mlir: bool = False,
         p_error: Optional[float] = None,
         global_p_error: Optional[float] = None,
         verbose: bool = False,
+        device: str = "cpu",
     ) -> Circuit:
         """Compile the model.
 
@@ -496,6 +557,10 @@ class BaseEstimator:
                 usually the training data-set or a sub-set of it.
             configuration (Optional[Configuration]): Options to use for compilation. Default
                 to None.
+            ciphertext_format (CiphertextFormat): The format of input/output ciphertexts. Can
+                be one of "concrete" or "tfhe-rs". When using tfhe-rs the model's
+                latency will be lower because of the necessary conversion between
+                tfhe-rs and concrete. Using tfhe-rs allows you to use fhEVM ciphertexts.
             artifacts (Optional[DebugArtifacts]): Artifacts information about the compilation
                 process to store for debugging. Default to None.
             show_mlir (bool): Indicate if the MLIR graph should be printed during compilation.
@@ -509,6 +574,7 @@ class BaseEstimator:
                 currently set to 0. Default to None, which sets this error to a default value.
             verbose (bool): Indicate if compilation information should be printed
                 during compilation. Default to False.
+            device: FHE compilation device, can be either 'cpu' or 'cuda'.
 
         Returns:
             Circuit: The compiled Circuit.
@@ -528,14 +594,38 @@ class BaseEstimator:
         # Find the right way to set parameters for compiler, depending on the way we want to default
         p_error, global_p_error = manage_parameters_for_pbs_errors(p_error, global_p_error)
 
+        use_gpu = check_compilation_device_is_valid_and_is_cuda(device)
+
         # Quantize the inputs
         q_X = self.quantize_input(X)
 
         # Generate the compilation input-set with proper dimensions
         inputset = _get_inputset_generator(q_X)
 
-        # Retrieve the compiler instance
-        module_to_compile = self._get_module_to_compile()
+        assert_true(
+            CiphertextFormat.is_valid(ciphertext_format),
+            (
+                f"{ciphertext_format} is an invalid value,"
+                f"should be one of {[i.value for i in CiphertextFormat]}"
+            ),
+        )
+
+        if ciphertext_format == CiphertextFormat.CONCRETE:
+            # Retrieve the compiler instance
+            module_to_compile = self._get_module_to_compile()
+        else:
+            assert ciphertext_format == CiphertextFormat.TFHE_RS
+            assert_true(
+                isinstance(self, BaseTreeEstimatorMixin)
+                and is_classifier_or_partial_classifier(self)
+                and self.input_quantizers[0].n_bits == 8,
+                (
+                    "TFHE-rs ciphertext inputs/outputs is only "
+                    "supported for 8-bit tree-based classifiers: "
+                    "DecisionTreeClassifier, RandomForestClassifier, XGBClassifier"
+                ),
+            )
+            module_to_compile = self._get_tfhers_module_to_compile(_get_inputset_generator(q_X))
 
         # Compiling using a QuantizedModule requires different steps and should not be done here
         assert isinstance(module_to_compile, Compiler), (
@@ -543,8 +633,27 @@ class BaseEstimator:
             f"{type(module_to_compile)}."
         )
 
-        # Jit compiler is now deprecated and will soon be removed, it is thus forced to False
-        # by default
+        # Enable input ciphertext compression
+        enable_input_compression = os.environ.get("USE_INPUT_COMPRESSION", "1") == "1"
+        # Enable evaluation key compression
+        enable_key_compression = os.environ.get("USE_KEY_COMPRESSION", "1") == "1"
+
+        if ciphertext_format == CiphertextFormat.TFHE_RS:
+            assert all(
+                (
+                    self.input_quantizers[i].is_signed == self.input_quantizers[0].is_signed
+                    for i in range(1, len(self.input_quantizers))
+                )
+            )
+            is_signed = self.input_quantizers[0].is_signed
+
+            crypto_params = json.loads(fhext.get_crypto_params_radix())  # pylint: disable=no-member
+            dtype_spec = tfhers.get_type_from_params_dict(  # pylint: disable=no-member
+                crypto_params, is_signed, 8
+            )  # pylint: disable=no-member
+            dtype = partial(tfhers.TFHERSInteger, dtype_spec)
+            inputset = (dtype(v) for v in inputset)
+
         self.fhe_circuit_ = module_to_compile.compile(
             inputset,
             configuration=configuration,
@@ -554,12 +663,19 @@ class BaseEstimator:
             global_p_error=global_p_error,
             verbose=verbose,
             single_precision=False,
-            fhe_simulation=False,
-            fhe_execution=True,
-            jit=False,
+            use_gpu=use_gpu,
+            compress_input_ciphertexts=enable_input_compression,
+            compress_evaluation_keys=enable_key_compression,
         )
 
         self._is_compiled = True
+        self._compiled_for_cuda = use_gpu
+
+        self._ciphertext_format = ciphertext_format
+        if ciphertext_format == CiphertextFormat.TFHE_RS:
+            self._tfhers_bridge = tfhers.new_bridge(self.fhe_circuit_)
+        else:
+            self._tfhers_bridge = None
 
         # For mypy
         assert isinstance(self.fhe_circuit, Circuit)
@@ -577,6 +693,56 @@ class BaseEstimator:
             numpy.ndarray: The quantized predicted values.
         """
 
+    def encrypt_run_decrypt_tfhers_concrete(self, *inputs):
+        """Execute in FHE with tfhe-rs ciphertexts.
+
+        Args:
+            inputs (Tuple[numpy.ndarray]): The quantized input values.
+
+        Returns:
+            numpy.ndarray: The quantized predicted values.
+        """
+
+        assert self.fhe_circuit is not None
+        assert self._tfhers_bridge is not None
+
+        input_is_signed = self.input_quantizers[0].is_signed
+
+        encrypt_dtype = numpy.int8 if input_is_signed else numpy.uint8
+        output_0 = self.fhe_circuit.graph.ordered_outputs()[0]
+        output_is_signed = output_0.inputs[0].dtype.is_signed
+        output_bitwidth = output_0.inputs[0].dtype.bit_width
+
+        assert self.tfhers_sk is not None
+
+        tfhers_x = tuple(
+            [
+                self._tfhers_bridge.import_value(
+                    fhext.encrypt_radix(inputs[idx].astype(encrypt_dtype), self.tfhers_sk),
+                    input_idx=idx,
+                )
+                for idx in range(len(inputs))
+            ]
+        )
+        result = self.fhe_circuit.server.run(
+            tfhers_x, evaluation_keys=self.fhe_circuit.client.evaluation_keys
+        )
+        buff = self._tfhers_bridge.export_value(result, output_idx=0)  # pylint: disable=no-member
+
+        # Get the output shape of the compiled function
+        out_shapes = self._tfhers_bridge.output_shapes_per_func  # pylint: disable=no-member
+        assert len(out_shapes) == 1
+        func_name = list(out_shapes.keys())[0]
+        shape = out_shapes[func_name][0]
+        num_cols = shape[1] if len(shape) > 1 else shape[0]
+
+        # The output bitwidth for trees should be the same as the input one
+        result_np = fhext.decrypt_radix(
+            buff, (-1, num_cols), output_bitwidth, output_is_signed, self.tfhers_sk
+        )
+        result_np = result_np.reshape(shape)
+        return result_np
+
     def predict(self, X: Data, fhe: Union[FheMode, str] = FheMode.DISABLE) -> numpy.ndarray:
         """Predict values for X, in FHE or in the clear.
 
@@ -591,7 +757,11 @@ class BaseEstimator:
 
         Returns:
             np.ndarray: The predicted values for X.
+
+        Raises:
+            ValueError: if the arguments are invalid
         """
+
         assert_true(
             FheMode.is_valid(fhe),
             "`fhe` mode is not supported. Expected one of 'disable' (resp. FheMode.DISABLE), "
@@ -603,6 +773,8 @@ class BaseEstimator:
         # Check that the model is properly fitted
         self.check_model_is_fitted()
 
+        check_execution_device_is_valid_and_is_cuda(self._compiled_for_cuda, fhe=fhe)
+
         # Ensure inputs are 2D
         if isinstance(X, (numpy.ndarray, torch.Tensor)) and X.ndim == 1:
             X = X.reshape((1, -1))
@@ -613,10 +785,54 @@ class BaseEstimator:
         # Quantize the input
         q_X = self.quantize_input(X)
 
+        predict_method: Callable
         # If the inference is executed in FHE or simulation mode
         if fhe in ["simulate", "execute"]:
             # Check that the model is properly compiled
             self.check_model_is_compiled()
+
+            # For mypy, even though we already check this with self.check_model_is_compiled()
+            assert self.fhe_circuit is not None
+
+            # If the inference should be executed using simulation
+            if fhe == "simulate":
+                if self._ciphertext_format == CiphertextFormat.TFHE_RS:
+                    raise ValueError(
+                        "Simulation with TFHE-rs ciphertext inputs/outputs is not yet implemented"
+                    )
+
+                is_crt_encoding = self.fhe_circuit.statistics["packing_key_switch_count"] != 0
+
+                # If the virtual library method should be used
+                # For now, use the virtual library when simulating
+                # circuits that use CRT  encoding because the official simulation is too slow
+                # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4391
+                if USE_OLD_VL or is_crt_encoding:
+                    predict_method = partial(
+                        self.fhe_circuit.graph, p_error=self.fhe_circuit.p_error
+                    )  # pragma: no cover
+
+                # Else, use the official simulation method
+                else:
+                    predict_method = self.fhe_circuit.simulate
+
+            # Else, use the FHE execution method
+            else:
+                if self._ciphertext_format == CiphertextFormat.TFHE_RS:
+                    assert self._tfhers_bridge is not None
+
+                    sk, _, lwe_sk = fhext.keygen_radix()  # pylint: disable=no-member
+
+                    self.tfhers_sk = sk
+
+                    input_idx_to_key = {0: lwe_sk}
+                    self._tfhers_bridge.keygen_with_initial_keys(  # pylint: disable=no-member
+                        input_idx_to_key_buffer=input_idx_to_key
+                    )
+
+                    predict_method = self.encrypt_run_decrypt_tfhers_concrete
+                else:
+                    predict_method = self.fhe_circuit.encrypt_run_decrypt
 
             q_y_pred_list = []
             for q_X_i in q_X:
@@ -624,29 +840,9 @@ class BaseEstimator:
                 # is of shape (n_features,)
                 q_X_i = numpy.expand_dims(q_X_i, 0)
 
-                # For mypy, even though we already check this with self.check_model_is_compiled()
-                assert self.fhe_circuit is not None
-
-                # If the inference should be executed using simulation
-                if fhe == "simulate":
-
-                    # If the old simulation method should be used
-                    if USE_OLD_VL:
-                        predict_method = partial(
-                            self.fhe_circuit.graph, p_error=self.fhe_circuit.p_error
-                        )
-
-                    # Else, use the official simulation method
-                    else:
-                        predict_method = self.fhe_circuit.simulate  # pragma: no cover
-
-                # Else, use the FHE execution method
-                else:
-                    predict_method = self.fhe_circuit.encrypt_run_decrypt
-
                 # Execute the inference in FHE or with simulation
                 q_y_pred_i = predict_method(q_X_i)
-
+                assert isinstance(q_y_pred_i, numpy.ndarray)
                 q_y_pred_list.append(q_y_pred_i[0])
 
             q_y_pred = numpy.array(q_y_pred_list)
@@ -657,10 +853,9 @@ class BaseEstimator:
 
         # De-quantize the predicted values in the clear
         y_pred = self.dequantize_output(q_y_pred)
-
+        assert isinstance(y_pred, numpy.ndarray)
         return y_pred
 
-    # pylint: disable-next=no-self-use
     def post_processing(self, y_preds: numpy.ndarray) -> numpy.ndarray:
         """Apply post-processing to the de-quantized predictions.
 
@@ -679,6 +874,8 @@ class BaseEstimator:
         Returns:
             numpy.ndarray: The post-processed predictions.
         """
+        assert isinstance(y_preds, numpy.ndarray), "Output predictions must be an array."
+
         return y_preds
 
 
@@ -790,8 +987,10 @@ class BaseClassifier(BaseEstimator):
 
             # If the prediction array is 1D, transform the output into a 2D array [1-p, p],
             # with p the initial output probabilities
+            # This is similar to what is done in scikit-learn
             if y_preds.ndim == 1 or y_preds.shape[1] == 1:
-                y_preds = numpy.concatenate((1 - y_preds, y_preds), axis=1)
+                y_preds = y_preds.flatten()
+                return numpy.vstack([1 - y_preds, y_preds]).T
 
         # Else, apply the softmax operator
         else:
@@ -804,11 +1003,12 @@ class BaseClassifier(BaseEstimator):
 # is expected as the QuantizedTorchEstimatorMixin class is not supposed to be used as such. This
 # disable could probably be removed when refactoring the serialization of models
 # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/3250
-# pylint: disable-next=abstract-method
+# pylint: disable-next=abstract-method,too-many-instance-attributes
 class QuantizedTorchEstimatorMixin(BaseEstimator):
     """Mixin that provides quantization for a torch module and follows the Estimator API."""
 
-    def __init_subclass__(cls):
+    def __init_subclass__(cls, *args, **kwargs):
+        super().__init_subclass__(*args, **kwargs)
         for klass in cls.__mro__:
             # pylint: disable-next=protected-access
             if getattr(klass, "_is_a_public_cml_model", False):
@@ -1115,9 +1315,11 @@ class QuantizedTorchEstimatorMixin(BaseEstimator):
         assert isinstance(q_X, numpy.ndarray)
         return q_X
 
-    def dequantize_output(self, q_y_preds: numpy.ndarray) -> numpy.ndarray:
+    def dequantize_output(self, *q_y_preds: numpy.ndarray) -> numpy.ndarray:
         self.check_model_is_fitted()
-        return self.quantized_module_.dequantize_output(q_y_preds)
+        result = self.quantized_module_.dequantize_output(*q_y_preds)
+        assert isinstance(result, numpy.ndarray)
+        return result
 
     def _get_module_to_compile(self) -> Union[Compiler, QuantizedModule]:
         return self.quantized_module_
@@ -1126,11 +1328,13 @@ class QuantizedTorchEstimatorMixin(BaseEstimator):
         self,
         X: Data,
         configuration: Optional[Configuration] = None,
+        ciphertext_format: Union[str, CiphertextFormat] = CiphertextFormat.CONCRETE,
         artifacts: Optional[DebugArtifacts] = None,
         show_mlir: bool = False,
         p_error: Optional[float] = None,
         global_p_error: Optional[float] = None,
         verbose: bool = False,
+        device: str = "cpu",
     ) -> Circuit:
         # Reset for double compile
         self._is_compiled = False
@@ -1140,6 +1344,23 @@ class QuantizedTorchEstimatorMixin(BaseEstimator):
 
         # Cast pandas, list or torch to numpy
         X = check_array_and_assert(X)
+
+        assert_true(
+            CiphertextFormat.is_valid(ciphertext_format),
+            (
+                f"{ciphertext_format} is an invalid value, "
+                f"should be one of {[i.value for i in CiphertextFormat]}"
+            ),
+        )
+
+        assert_true(
+            ciphertext_format == CiphertextFormat.CONCRETE,
+            (
+                "TFHE-rs ciphertext inputs/outputs is only "
+                "supported for 8-bit tree-based classifiers: "
+                "DecisionTreeClassifier, RandomForestClassifier, XGBClassifier"
+            ),
+        )
 
         # Retrieve the module instance to compile
         module_to_compile = self._get_module_to_compile()
@@ -1153,6 +1374,7 @@ class QuantizedTorchEstimatorMixin(BaseEstimator):
             p_error=p_error,
             global_p_error=global_p_error,
             verbose=verbose,
+            device=device,
         )
 
         # Make sure that no avoidable TLUs are found in the built-in model
@@ -1170,7 +1392,9 @@ class QuantizedTorchEstimatorMixin(BaseEstimator):
     def _inference(self, q_X: numpy.ndarray) -> numpy.ndarray:
         self.check_model_is_fitted()
 
-        return self.quantized_module_.quantized_forward(q_X)
+        result = self.quantized_module_.quantized_forward(q_X)
+        assert isinstance(result, numpy.ndarray)
+        return result
 
     def post_processing(self, y_preds: numpy.ndarray) -> numpy.ndarray:
         # Cast the predictions to float32 in order to match Torch's softmax outputs
@@ -1261,25 +1485,121 @@ class BaseTreeEstimatorMixin(BaseEstimator, sklearn.base.BaseEstimator, ABC):
     #: Model's base framework used, either 'xgboost' or 'sklearn'. Is set for each subclasses.
     framework: str
 
-    def __init_subclass__(cls):
+    def __init_subclass__(cls, *args, **kwargs):
+        super().__init_subclass__(*args, **kwargs)
         for klass in cls.__mro__:
             # pylint: disable-next=protected-access
             if getattr(klass, "_is_a_public_cml_model", False):
                 _TREE_MODELS.add(cls)
                 _ALL_SKLEARN_MODELS.add(cls)
 
-    def __init__(self, n_bits: int):
+    def __init__(self, n_bits: Union[int, Dict[str, int]]):
         """Initialize the TreeBasedEstimatorMixin.
 
         Args:
-            n_bits (int): The number of bits used for quantization.
+            n_bits (int, Dict[str, int]): Number of bits to quantize the model. If an int is passed
+                for n_bits, the value will be used for quantizing inputs and leaves. If a dict is
+                passed, then it should contain "op_inputs" and "op_leaves" as keys with
+                corresponding number of quantization bits so that:
+                    - op_inputs (mandatory): number of bits to quantize the input values
+                    - op_leaves (optional): number of bits to quantize the leaves
+                Default to 6.
         """
-        self.n_bits: int = n_bits
+
+        # Check if 'n_bits' is a valid value.
+        _inspect_tree_n_bits(n_bits)
+
+        self.n_bits: Union[int, Dict[str, int]] = n_bits
 
         #: The model's inference function. Is None if the model is not fitted.
         self._tree_inference: Optional[Callable] = None
 
+        #: Wether to perform the sum of the output's tree ensembles in FHE or not.
+        # By default, the decision of the tree ensembles is made in clear (not in FHE).
+        # This attribute should not be modified by users.
+        self._fhe_ensembling = False
+
         BaseEstimator.__init__(self)
+
+    @classmethod
+    def from_sklearn_model(
+        cls,
+        sklearn_model: sklearn.base.BaseEstimator,
+        X: Optional[numpy.ndarray] = None,
+        n_bits: int = 10,
+    ):
+        """Build a FHE-compliant model using a fitted scikit-learn model.
+
+        Args:
+            sklearn_model (sklearn.base.BaseEstimator): The fitted scikit-learn model to convert.
+            X (Optional[Data]): A representative set of input values used for computing quantization
+                parameters, as a Numpy array, Torch tensor, Pandas DataFrame or List. This is
+                usually the training data-set or a sub-set of it.
+            n_bits (int): Number of bits to quantize the model. If an int is passed
+                for n_bits, the value will be used for quantizing inputs and weights. If a dict is
+                passed, then it should contain "op_inputs" and "op_weights" as keys with
+                corresponding number of quantization bits so that:
+                - op_inputs : number of bits to quantize the input values
+                - op_weights: number of bits to quantize the learned parameters
+                Default to 8.
+
+        Returns:
+            The FHE-compliant fitted model.
+        """
+        # Check that sklearn_model is a proper fitted scikit-learn model
+        check_is_fitted(sklearn_model)
+
+        # Extract scikit-learn's initialization parameters
+        init_params = sklearn_model.get_params()
+        model = cls(n_bits=n_bits, **init_params)
+        model._is_fitted = True
+
+        # Update the underlying scikit-learn model with the given fitted one
+        model.sklearn_model = copy.deepcopy(sklearn_model)
+
+        # Get the onnx model, all operations needed to load it properly will be done on it.
+        n_features = model.n_features_in_
+        # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4545
+        # Execute with 2 example for efficiency in large data scenarios to prevent slowdown
+        # but also to work around the HB export issue.
+        dummy_input = numpy.zeros((2, n_features))
+        framework = "xgboost" if isinstance(sklearn_model, XGBModel) else "sklearn"
+        onnx_model = get_onnx_model(
+            model=sklearn_model,
+            x=dummy_input,
+            framework=framework,
+        )
+
+        # Tree values pre-processing
+        # i.e., mainly predictions quantization
+        # but also rounding the threshold such that they are now integers
+        model._set_post_processing_params()
+
+        # Get the expected number of ONNX outputs in the sklearn model.
+        expected_number_of_outputs = 1 if is_regressor_or_partial_regressor(model) else 2
+
+        (
+            onnx_model,
+            lsbs_to_remove_for_trees,
+            input_quantizers,
+            output_quantizers,
+        ) = onnx_fp32_model_to_quantized_model(
+            onnx_model,
+            n_bits,
+            framework,
+            expected_number_of_outputs,
+            n_features,
+            X,
+        )
+
+        model.input_quantizers = input_quantizers
+        model.output_quantizers = output_quantizers
+
+        model._tree_inference, model.onnx_model_ = get_equivalent_numpy_forward_from_onnx_tree(
+            onnx_model, lsbs_to_remove_for_trees=lsbs_to_remove_for_trees
+        )
+
+        return model
 
     def fit(self, X: Data, y: Target, **fit_parameters):
         # Reset for double fit
@@ -1291,9 +1611,14 @@ class BaseTreeEstimatorMixin(BaseEstimator, sklearn.base.BaseEstimator, ABC):
 
         q_X = numpy.zeros_like(X)
 
+        # Convert the n_bits attribute into a proper dictionary
+        self.n_bits = _get_n_bits_dict_trees(self.n_bits)
+
         # Quantization of each feature in X
         for i in range(X.shape[1]):
-            input_quantizer = QuantizedArray(n_bits=self.n_bits, values=X[:, i]).quantizer
+            input_quantizer = QuantizedArray(
+                n_bits=self.n_bits["op_inputs"], values=X[:, i]
+            ).quantizer
             self.input_quantizers.append(input_quantizer)
             q_X[:, i] = input_quantizer.quant(X[:, i])
 
@@ -1306,12 +1631,27 @@ class BaseTreeEstimatorMixin(BaseEstimator, sklearn.base.BaseEstimator, ABC):
         # Check that the underlying sklearn model has been set and fit
         assert self.sklearn_model is not None, self._sklearn_model_is_not_fitted_error_message()
 
+        # Enable rounding feature
+        enable_rounding = os.environ.get("TREES_USE_ROUNDING", "1") == "1"
+
+        if not enable_rounding:
+            warnings.simplefilter("always")
+            warnings.warn(
+                "Using Concrete tree-based models without the `rounding feature` is deprecated. "
+                "Consider setting 'use_rounding' to `True` for making the FHE inference faster "
+                "and key generation.",
+                category=DeprecationWarning,
+                stacklevel=2,
+            )
+
         # Convert the tree inference with Numpy operators
         self._tree_inference, self.output_quantizers, self.onnx_model_ = tree_to_numpy(
             self.sklearn_model,
-            q_X[:1],
+            q_X,
+            use_rounding=enable_rounding,
+            fhe_ensembling=self._fhe_ensembling,
             framework=self.framework,
-            output_n_bits=self.n_bits,
+            output_n_bits=self.n_bits["op_leaves"],
         )
 
         self._is_fitted = True
@@ -1333,10 +1673,18 @@ class BaseTreeEstimatorMixin(BaseEstimator, sklearn.base.BaseEstimator, ABC):
     def dequantize_output(self, q_y_preds: numpy.ndarray) -> numpy.ndarray:
         self.check_model_is_fitted()
 
-        q_y_preds = self.output_quantizers[0].dequant(q_y_preds)
-        return q_y_preds
+        y_preds = self.output_quantizers[0].dequant(q_y_preds)
+        assert isinstance(y_preds, numpy.ndarray)
 
-    def _get_module_to_compile(self) -> Union[Compiler, QuantizedModule]:
+        # If the preds have shape (n, 1), squeeze it to shape (n,) like in scikit-learn
+        if y_preds.ndim == 2 and y_preds.shape[1] == 1:
+            return y_preds.ravel()
+
+        return y_preds
+
+    def _get_module_to_compile(
+        self,
+    ) -> Union[Compiler, QuantizedModule]:
         assert self._tree_inference is not None, self._is_not_fitted_error_message()
 
         # Generate the proxy function to compile
@@ -1384,12 +1732,42 @@ class BaseTreeEstimatorMixin(BaseEstimator, sklearn.base.BaseEstimator, ABC):
 
     def post_processing(self, y_preds: numpy.ndarray) -> numpy.ndarray:
         # Sum all tree outputs
-        # Remove the sum once we handle multi-precision circuits
-        # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/451
-        y_preds = numpy.sum(y_preds, axis=-1)
+        # Only apply the sum in the clear if it has not already been done in FHE
+        if not self._fhe_ensembling:
+            y_preds = numpy.sum(y_preds, axis=-1)
 
-        assert_true(y_preds.ndim == 2, "y_preds should be a 2D array")
-        return y_preds
+            assert isinstance(y_preds, numpy.ndarray), "Output predictions must be an array."
+
+            # If the preds have shape (n, 1), squeeze it to shape (n,) like in scikit-learn
+            if y_preds.ndim == 2 and y_preds.shape[1] == 1:
+                return y_preds.ravel()
+
+            return y_preds
+
+        return super().post_processing(y_preds)
+
+    def get_sklearn_params(self, deep: bool = True) -> dict:
+        """Get parameters for this estimator.
+
+        This method is used to instantiate a scikit-learn model using the Concrete ML model's
+        parameters. It does not override scikit-learn's existing `get_params` method in order to
+        not break its implementation of `set_params`.
+
+        Args:
+            deep (bool): If True, will return the parameters for this estimator and contained
+                subobjects that are estimators. Default to True.
+
+        Returns:
+            params (dict): Parameter names mapped to their values.
+        """
+        # pylint: disable-next=no-member
+        params = super().get_params(deep=deep)  # type: ignore[misc]
+
+        params.pop("n_bits", None)
+        if "1.1." in sklearn.__version__:
+            params.pop("monotonic_cst", None)  # pragma: no cover
+
+        return params
 
 
 class BaseTreeRegressorMixin(BaseTreeEstimatorMixin, sklearn.base.RegressorMixin, ABC):
@@ -1423,7 +1801,8 @@ class SklearnLinearModelMixin(BaseEstimator, sklearn.base.BaseEstimator, ABC):
     `get_params` and `set_params` methods.
     """
 
-    def __init_subclass__(cls):
+    def __init_subclass__(cls, *args, **kwargs):
+        super().__init_subclass__(*args, **kwargs)
         for klass in cls.__mro__:
             # pylint: disable-next=protected-access
             if getattr(klass, "_is_a_public_cml_model", False):
@@ -1480,12 +1859,17 @@ class SklearnLinearModelMixin(BaseEstimator, sklearn.base.BaseEstimator, ABC):
         Returns:
             The FHE-compliant fitted model.
         """
-
         # Check that sklearn_model is a proper fitted scikit-learn model
         check_is_fitted(sklearn_model)
 
         # Extract scikit-learn's initialization parameters
         init_params = sklearn_model.get_params()
+
+        # Ensure compatibility for both sklearn 1.1 and >=1.5
+        # This parameter was removed in 1.5. If this package is installed
+        # with sklearn 1.1 which has it, then remove it when
+        # instantiating the 1.5 API compatible Concrete ML model
+        init_params.pop("normalize", None)
 
         # Instantiate the Concrete ML model and update initialization parameters
         # This update is necessary as we currently store scikit-learn attributes in Concrete ML
@@ -1569,7 +1953,7 @@ class SklearnLinearModelMixin(BaseEstimator, sklearn.base.BaseEstimator, ABC):
         # Quantize the inputs and store the associated quantizer
         q_inputs = QuantizedArray(n_bits=input_n_bits, values=X, options=input_options)
         input_quantizer = q_inputs.quantizer
-        self.input_quantizers.append(input_quantizer)
+        self.input_quantizers = [input_quantizer]
 
         weights_n_bits = n_bits["op_weights"]
         weight_options = QuantizationOptions(n_bits=weights_n_bits, is_signed=True)
@@ -1580,7 +1964,7 @@ class SklearnLinearModelMixin(BaseEstimator, sklearn.base.BaseEstimator, ABC):
         weights = self.sklearn_model.coef_.T
         q_weights = QuantizedArray(
             n_bits=n_bits["op_weights"],
-            values=numpy.expand_dims(weights, axis=1) if len(weights.shape) == 1 else weights,
+            values=(numpy.expand_dims(weights, axis=1) if len(weights.shape) == 1 else weights),
             options=weight_options,
         )
         self._q_weights = q_weights.qvalues
@@ -1615,7 +1999,7 @@ class SklearnLinearModelMixin(BaseEstimator, sklearn.base.BaseEstimator, ABC):
         # output zero_point by 2
         assert output_quantizer.zero_point is not None
         output_quantizer.zero_point *= 2
-        self.output_quantizers.append(output_quantizer)
+        self.output_quantizers = [output_quantizer]
 
         # Updating post-processing parameters
         self._set_post_processing_params()
@@ -1636,10 +2020,18 @@ class SklearnLinearModelMixin(BaseEstimator, sklearn.base.BaseEstimator, ABC):
 
         # De-quantize the output values
         y_preds = self.output_quantizers[0].dequant(q_y_preds)
+        assert isinstance(y_preds, numpy.ndarray)
+
+        # If the preds have shape (n, 1), squeeze it to shape (n,) like in scikit-learn
+        if y_preds.ndim == 2 and y_preds.shape[1] == 1:
+            return y_preds.ravel()
 
         return y_preds
 
-    def _get_module_to_compile(self) -> Union[Compiler, QuantizedModule]:
+    def _get_module_to_compile(
+        self,
+    ) -> Union[Compiler, QuantizedModule]:
+
         # Define the inference function to compile.
         # This function can neither be a class method nor a static one because self we want to avoid
         # having self as a parameter while still being able to access some of its attribute
@@ -1655,9 +2047,7 @@ class SklearnLinearModelMixin(BaseEstimator, sklearn.base.BaseEstimator, ABC):
             return self._inference(q_X)
 
         # Create the compiler instance
-        compiler = Compiler(inference_to_compile, {"q_X": "encrypted"})
-
-        return compiler
+        return Compiler(inference_to_compile, {"q_X": "encrypted"})
 
     def _inference(self, q_X: numpy.ndarray) -> numpy.ndarray:
         assert self._weight_quantizer is not None, self._is_not_fitted_error_message()
@@ -1719,13 +2109,98 @@ class SklearnLinearClassifierMixin(
         """
         # Here, we want to use SklearnLinearModelMixin's `predict` method as confidence scores are
         # the dot product's output values, without any post-processing
-        y_preds = SklearnLinearModelMixin.predict(self, X, fhe=fhe)
-        return y_preds
+        y_scores = SklearnLinearModelMixin.predict(self, X, fhe=fhe)
+
+        return y_scores
 
     def predict_proba(self, X: Data, fhe: Union[FheMode, str] = FheMode.DISABLE) -> numpy.ndarray:
-        y_logits = self.decision_function(X, fhe=fhe)
-        y_proba = self.post_processing(y_logits)
+        y_scores = self.decision_function(X, fhe=fhe)
+        y_proba = self.post_processing(y_scores)
         return y_proba
+
+    # In scikit-learn, the argmax is done on the scores directly, not the probabilities
+    def predict(self, X: Data, fhe: Union[FheMode, str] = FheMode.DISABLE) -> numpy.ndarray:
+        # Compute the predicted scores
+        y_scores = self.decision_function(X, fhe=fhe)
+
+        # Retrieve the class with the highest score
+        # If there is a single dimension, only compare the scores to 0
+        if y_scores.ndim == 1:
+            y_preds = (y_scores > 0).astype(int)
+        else:
+            y_preds = numpy.argmax(y_scores, axis=1)
+
+        return self.classes_[y_preds]
+
+
+class SklearnSGDRegressorMixin(SklearnLinearRegressorMixin):
+    """A Mixin class for sklearn SGD regressors with FHE.
+
+    This class is used to create a SGD regressor class what can be exported
+    to ONNX using Hummingbird.
+    """
+
+    # Remove once Hummingbird supports SGDRegressor
+    # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4100
+    def _set_onnx_model(self, test_input: numpy.ndarray) -> None:
+        """Retrieve the model's ONNX graph using Hummingbird conversion.
+
+        Args:
+            test_input (numpy.ndarray): An input data used to trace the model execution.
+        """
+        # Check that the underlying sklearn model has been set and fit
+        assert self.sklearn_model is not None, self._sklearn_model_is_not_fitted_error_message()
+
+        model_for_onnx = LinearRegression()
+        model_for_onnx.coef_ = self.sklearn_model.coef_
+        model_for_onnx.intercept_ = self.sklearn_model.intercept_
+
+        self.onnx_model_ = hb_convert(
+            model_for_onnx,
+            backend="onnx",
+            test_input=test_input,
+            extra_config={"onnx_target_opset": OPSET_VERSION_FOR_ONNX_EXPORT},
+        ).model
+
+        self._clean_graph()
+
+
+class SklearnSGDClassifierMixin(SklearnLinearClassifierMixin):
+    """A Mixin class for sklearn SGD classifiers with FHE.
+
+    This class is used to create a SGD classifier class what can be exported
+    to ONNX using Hummingbird.
+    """
+
+    # Remove once Hummingbird supports SGDClassifier
+    # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4100
+    def _set_onnx_model(self, test_input: numpy.ndarray) -> None:
+        """Retrieve the model's ONNX graph using Hummingbird conversion.
+
+        Args:
+            test_input (numpy.ndarray): An input data used to trace the model execution.
+        """
+        # Check that the underlying sklearn model has been set and fit
+        assert self.sklearn_model is not None, self._sklearn_model_is_not_fitted_error_message()
+
+        model_for_onnx = LogisticRegression()
+        model_for_onnx.coef_ = self.sklearn_model.coef_
+        model_for_onnx.intercept_ = self.sklearn_model.intercept_
+
+        assert_true(
+            hasattr(self.sklearn_model, "classes_"),
+            "The fit method should have been called on this model",
+        )
+        model_for_onnx.classes_ = getattr(self.sklearn_model, "classes_", None)
+
+        self.onnx_model_ = hb_convert(
+            model_for_onnx,
+            backend="onnx",
+            test_input=test_input,
+            extra_config={"onnx_target_opset": OPSET_VERSION_FOR_ONNX_EXPORT},
+        ).model
+
+        self._clean_graph()
 
 
 # pylint: disable-next=invalid-name,too-many-instance-attributes
@@ -1736,7 +2211,8 @@ class SklearnKNeighborsMixin(BaseEstimator, sklearn.base.BaseEstimator, ABC):
     `get_params` and `set_params` methods.
     """
 
-    def __init_subclass__(cls):
+    def __init_subclass__(cls, *args, **kwargs):
+        super().__init_subclass__(*args, **kwargs)
         for klass in cls.__mro__:
             # pylint: disable-next=protected-access
             if getattr(klass, "_is_a_public_cml_model", False):
@@ -1751,12 +2227,15 @@ class SklearnKNeighborsMixin(BaseEstimator, sklearn.base.BaseEstimator, ABC):
                 quantizing inputs and X_fit. Default to 3.
         """
         self.n_bits: int = n_bits
+
         # _q_fit_X: In distance metric algorithms, `_q_fit_X` stores the training set to compute
         # the similarity or distance measures. There is no `weights` attribute because there isn't
         # a training phase
         self._q_fit_X: numpy.ndarray
+
         # _y: Labels of `_q_fit_X`
         self._y: numpy.ndarray
+
         # _q_fit_X_quantizer: The quantizer to use for quantizing the model's training set
         self._q_fit_X_quantizer: Optional[UniformQuantizer] = None
 
@@ -1821,7 +2300,7 @@ class SklearnKNeighborsMixin(BaseEstimator, sklearn.base.BaseEstimator, ABC):
         # We assume that the inputs have the same distribution as the _fit_X
         q_fit_X = QuantizedArray(
             n_bits=self.n_bits,
-            values=numpy.expand_dims(_fit_X, axis=1) if len(_fit_X.shape) == 1 else _fit_X,
+            values=(numpy.expand_dims(_fit_X, axis=1) if len(_fit_X.shape) == 1 else _fit_X),
             options=input_options,
         )
         self._q_fit_X = q_fit_X.qvalues
@@ -1865,9 +2344,16 @@ class SklearnKNeighborsMixin(BaseEstimator, sklearn.base.BaseEstimator, ABC):
         self.check_model_is_fitted()
         # We compute the sorted argmax in FHE, which are integers.
         # No need to de-quantize the output values
+
+        # If the preds have shape (n, 1), squeeze it to shape (n,) like in scikit-learn
+        if q_y_preds.ndim > 1 and q_y_preds.shape[1] == 1:
+            return q_y_preds.ravel()
+
         return q_y_preds
 
-    def _get_module_to_compile(self) -> Union[Compiler, QuantizedModule]:
+    def _get_module_to_compile(
+        self,
+    ) -> Union[Compiler, QuantizedModule]:
         # Define the inference function to compile.
         # This function can neither be a class method nor a static one because self we want to avoid
         # having self as a parameter while still being able to access some of its attribute
@@ -1948,7 +2434,7 @@ class SklearnKNeighborsMixin(BaseEstimator, sklearn.base.BaseEstimator, ABC):
                 arr = []
                 for i in indices:
                     arr.append(x[i])
-                enc_arr = cnp.array(arr)
+                enc_arr = cp.array(arr)
                 return enc_arr
 
             def scatter1d(x, v, indices):
@@ -1969,7 +2455,7 @@ class SklearnKNeighborsMixin(BaseEstimator, sklearn.base.BaseEstimator, ABC):
                 return x
 
             comparisons = numpy.zeros(x.shape)
-            labels = labels + cnp.zeros(labels.shape)
+            labels = labels + cp.zeros(labels.shape)
 
             n, k = x.size, self.n_neighbors
             # Determine the number of stages for a sequence of length n
@@ -1985,7 +2471,7 @@ class SklearnKNeighborsMixin(BaseEstimator, sklearn.base.BaseEstimator, ABC):
                 d = p
                 # Number of passes for each stage
                 for bq in range(ln2n - 1, t - 1, -1):
-                    with cnp.tag(f"Stage_{t}_pass_{bq}"):
+                    with cp.tag(f"Stage_{t}_pass_{bq}"):
                         q = 2**bq
                         # Determine the range of indexes to be compared
                         range_i = numpy.array(
@@ -2008,14 +2494,14 @@ class SklearnKNeighborsMixin(BaseEstimator, sklearn.base.BaseEstimator, ABC):
                         labels_a = gather1d(labels, range_i)  #
                         labels_b = gather1d(labels, range_i + d)  # idx[range_i + d]
 
-                        with cnp.tag("diff"):
+                        with cp.tag("diff"):
                             # Select max(a, b)
                             diff = b - a
 
-                        with cnp.tag("max_value"):
+                        with cp.tag("max_value"):
                             max_x = a + numpy.maximum(0, diff)
 
-                        with cnp.tag("swap_max_value"):
+                        with cp.tag("swap_max_value"):
                             # Swap if a > b
                             # x[range_i] = max_x(a, b): First bitonic sequence gets min(a, b)
                             x = scatter1d(x, a + b - max_x, range_i)
@@ -2023,16 +2509,16 @@ class SklearnKNeighborsMixin(BaseEstimator, sklearn.base.BaseEstimator, ABC):
                             x = scatter1d(x, max_x, range_i + d)
 
                         # Update labels array according to the max value
-                        with cnp.tag("max_label"):
+                        with cp.tag("max_label"):
                             is_a_greater_than_b = diff > 0
                             max_labels = labels_a + (labels_b - labels_a) * is_a_greater_than_b
 
-                        with cnp.tag("swap_max_label"):
+                        with cp.tag("swap_max_label"):
                             labels = scatter1d(labels, labels_a + labels_b - max_labels, range_i)
                             labels = scatter1d(labels, max_labels, range_i + d)
 
                         # Update
-                        with cnp.tag("update"):
+                        with cp.tag("update"):
                             comparisons[range_i + d] = comparisons[range_i + d] + 1
                             # Reduce the comparison distance by half
                             d = q - p
@@ -2041,7 +2527,7 @@ class SklearnKNeighborsMixin(BaseEstimator, sklearn.base.BaseEstimator, ABC):
             return labels[0 : self.n_neighbors]
 
         # 1. Pairwise_euclidiean distance
-        with cnp.tag("Original distance"):
+        with cp.tag("Original distance"):
             distance_matrix = pairwise_euclidean_distance(q_X)
 
         # The square root in the Euclidean distance calculation is not applied to speed up FHE

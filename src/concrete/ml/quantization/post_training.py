@@ -1,13 +1,17 @@
 """Post Training Quantization methods."""
 
+import enum
 from abc import abstractmethod
+from numbers import Integral
 from typing import Dict, List, Optional, Set, Tuple, Type, Union, cast
 
 import numpy
 import onnx
+from concrete.fhe.tracing import Tracer
 from onnx import numpy_helper
 
 from ..common.debugging import assert_true
+from ..common.utils import process_rounding_threshold_bits
 from ..onnx.onnx_utils import ONNX_OPS_TO_NUMPY_IMPL, get_attribute, get_op_type
 from ..onnx.ops_impl import RawOpOutput
 from ..torch.numpy_module import NumpyModule
@@ -22,6 +26,102 @@ from .quantized_module import QuantizedModule
 from .quantized_module_passes import PowerOfTwoScalingRoundPBSAdapter
 from .quantized_ops import QuantizedBrevitasQuant
 from .quantizers import QuantizationOptions, QuantizedArray, UniformQuantizer
+
+
+# pylint: disable=too-many-lines
+def _inspect_tree_n_bits(n_bits: Union[int, Dict[str, int]]) -> None:
+    """Validate the 'n_bits' parameter for tree-based models.
+
+    This function checks whether 'n_bits' is a valid integer or dictionary.
+    - If 'n_bits' is an integer, it must be a non-null positive, its value is assigned to
+        'op_inputs' and 'op_leaves' bits
+    - If it is a dictionary, it should contain integer values for keys 'op_leaves' and 'op_inputs',
+        where 'op_leaves' should not exceed 'op_inputs'.
+
+    The function raises a ValueError with a descriptive message if 'n_bits' does not meet
+    these criteria.
+
+    Args:
+        n_bits (int, Dict[str, int]): number of bits for quantization, can be a single value or
+            a dictionary with the following keys :
+            - "op_inputs" (mandatory): number of bits to quantize the input values
+            - "op_leaves" (optional): number of bits to quantize the leaves, must be less than or
+                equal to 'op_inputs'. Defaults to the value of 'op_inputs' if not specified.
+
+    Raises:
+        ValueError: If 'n_bits' does not conform to the required format or value constraints.
+    """
+
+    detailed_message = (
+        "Invalid 'n_bits', either pass a strictly positive integer or a dictionary containing "
+        "integer values for the following keys:\n"
+        "- 'op_inputs' (mandatory): number of bits to quantize the input values\n"
+        "- 'op_leaves' (optional): number of bits to quantize the leaves, must be less than or "
+        "equal to 'op_inputs'. Defaults to the value of 'op_inputs' if not specified.\n"
+        "When using a single integer for n_bits, its value is assigned to 'op_inputs' and "
+        "'op_leaves' bits.\n"
+    )
+
+    error_message = ""
+
+    if isinstance(n_bits, Integral):
+        if n_bits <= 0:
+            error_message = "n_bits must be a strictly positive integer"
+    elif isinstance(n_bits, dict):
+        if "op_inputs" not in n_bits:
+            error_message = "Invalid keys in `n_bits` dictionary. The key 'op_inputs' is mandatory"
+        elif set(n_bits.keys()) - {"op_leaves", "op_inputs"}:
+            error_message = (
+                "Invalid keys in 'n_bits' dictionary. Only 'op_inputs' (mandatory) and 'op_leaves' "
+                "(optional) are allowed"
+            )
+        elif not all(isinstance(value, Integral) and value > 0 for value in n_bits.values()):
+            error_message = "All values in 'n_bits' dictionary must be strictly positive integers"
+        elif "op_leaves" in n_bits and n_bits["op_leaves"] > n_bits["op_inputs"]:
+            error_message = "'op_leaves' must be less than or equal to 'op_inputs'"
+    else:
+        error_message = "n_bits must be either an integer or a dictionary"
+
+    if len(error_message) > 0:
+        raise ValueError(
+            f"{error_message}. Got '{type(n_bits)}' and '{n_bits}' value.\n{detailed_message}"
+        )
+
+
+# Find a better naming to describe leaf quantization in tree-based models
+# FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4258
+def _get_n_bits_dict_trees(n_bits: Union[int, Dict[str, int]]) -> Dict[str, int]:
+    """Convert the n_bits parameter into a proper dictionary for tree based-models.
+
+    Args:
+        n_bits (int, Dict[str, int]): number of bits for quantization, can be a single value or
+            a dictionary with the following keys :
+            - "op_inputs" (mandatory): number of bits to quantize the input values
+            - "op_leaves" (optional): number of bits to quantize the leaves, must be less than or
+                equal to 'op_inputs'. defaults to the value of "op_inputs" if not specified.
+
+            When using a single integer for n_bits, its value is assigned to "op_inputs" and
+            "op_leaves" bits.
+
+    Returns:
+        n_bits_dict (Dict[str, int]): A dictionary properly representing the number of bits to use
+            for quantization.
+    """
+
+    _inspect_tree_n_bits(n_bits)
+
+    # If a single integer is passed, we use a default value for the model's input and leaves
+    if isinstance(n_bits, Integral):
+        return {"op_inputs": int(n_bits), "op_leaves": int(n_bits)}
+
+    # At this point we know n_bits is a Dict[str, int]
+    n_bits_dict: Dict[str, int] = dict(cast(Dict[str, int], n_bits))
+
+    # Default 'op_leaves' to 'op_inputs' if not specified
+    if "op_leaves" not in n_bits_dict:
+        n_bits_dict["op_leaves"] = n_bits_dict["op_inputs"]
+
+    return n_bits_dict
 
 
 def get_n_bits_dict(n_bits: Union[int, Dict[str, int]]) -> Dict[str, int]:
@@ -90,6 +190,14 @@ def get_n_bits_dict(n_bits: Union[int, Dict[str, int]]) -> Dict[str, int]:
     return n_bits_dict
 
 
+class CalibrationMode(enum.Enum):
+    """Simple enum for different modes of execution of HybridModel."""
+
+    RAW = "raw"  # Output the raw float values, process rounding
+    QUANTIZED = "quantized"  # Output the de-quantized values, process rounding
+    FAST_RAW = "fast"  # Output raw float values, don't process rounding
+
+
 class ONNXConverter:
     """Base ONNX to Concrete ML computation graph conversion class.
 
@@ -116,28 +224,30 @@ class ONNXConverter:
             of the network's inputs. "op_inputs" and "op_weights" both control the quantization for
             inputs and weights of all layers.
         numpy_model (NumpyModule): Model in numpy.
-        rounding_threshold_bits (int): if not None, every accumulators in the model are rounded down
-            to the given bits of precision
+        rounding_threshold_bits (Union[None, int, Dict[str, Union[str, int]]]): Defines precision
+            rounding for model accumulators. Accepts None, an int, or a dict.
+            The dict can specify 'method' (fhe.Exactness.EXACT or fhe.Exactness.APPROXIMATE)
+            and 'n_bits' ('auto' or int)
     """
 
     quant_ops_dict: Dict[str, Tuple[Tuple[str, ...], QuantizedOp]]
     n_bits: Dict[str, int]
     quant_params: Dict[str, numpy.ndarray]
     numpy_model: NumpyModule
-    rounding_threshold_bits: Optional[int]
+    rounding_threshold_bits: Union[None, int, Dict[str, Union[str, int]]]
 
     def __init__(
         self,
         n_bits: Union[int, Dict],
         numpy_model: NumpyModule,
-        rounding_threshold_bits: Optional[int] = None,
+        rounding_threshold_bits: Union[None, int, Dict[str, Union[str, int]]] = None,
     ):
         self.quant_ops_dict = {}
 
         self.n_bits = get_n_bits_dict(n_bits)
         self.quant_params = {}
         self.numpy_model = numpy_model
-        self.rounding_threshold_bits = rounding_threshold_bits
+        self.rounding_threshold_bits = process_rounding_threshold_bits(rounding_threshold_bits)
 
     @property
     def n_bits_model_outputs(self):
@@ -181,6 +291,7 @@ class ONNXConverter:
         quantized_op: QuantizedOp,
         *calibration_data: numpy.ndarray,
         quantizers: List[Optional[UniformQuantizer]],
+        fast_calibration: bool = False,
     ) -> Tuple[numpy.ndarray, Optional[UniformQuantizer]]:
         """Configure a graph operation according to model conversion mode.
 
@@ -192,6 +303,10 @@ class ONNXConverter:
                 should produce the quantized values used in calibration. If none are given,
                 the calibration will generate the quantized values with the layer's input
                 calibration options.
+            fast_calibration (bool): whether to perform calibration without
+                computing the result of the operation on calibration data, but
+                rather by using analytical formulas to determine the output
+                quantization parameters
 
         Returns:
             numpy.ndarray: calibration data for the following operators
@@ -199,7 +314,7 @@ class ONNXConverter:
 
     def _calibrate_layers_activation(
         self,
-        calibrate_quantized: bool,
+        calibrate_mode: CalibrationMode,
         quantized_op: QuantizedOp,
         *calibration_data: numpy.ndarray,
         quantizers: List[Optional[UniformQuantizer]],
@@ -207,8 +322,9 @@ class ONNXConverter:
         """Calibrate the QuantizedOp with the previous layer's output calibration data.
 
         Args:
-            calibrate_quantized (bool): determines if we use de-quantized values (True) or
-                raw values (False) during calibration.
+            calibrate_mode (CalibrationMode): whether to use data-based quantization for
+                output de-quantized values or raw values during calibration,
+                or analytically determine output quantization parameters (for linear layers)
             quantized_op (QuantizedOp): the quantized operator for the current layer.
             *calibration_data: numpy.ndarray: the previous layer's calibration data.
             quantizers (List[Optional[UniformQuantizer]]): a list of quantizers that
@@ -219,9 +335,6 @@ class ONNXConverter:
         Returns:
             numpy.ndarray: the output of the newly calibrated layer.
         """
-        # Calibrate the output of the layer
-        raw_result = quantized_op.calibrate(*calibration_data)
-
         # Some operators need to quantize their inputs using model_outputs instead of op_inputs in
         # order to reduce the impact of quantization.
         if quantized_op.quantize_inputs_with_model_outputs_precision:
@@ -231,33 +344,54 @@ class ONNXConverter:
 
         # Create new calibration data (output of the previous layer)
         # Use the op's input options (thus behavior in calibration is the same as in compilation)
-        q_calibration_data: List[ONNXOpInputOutputType] = []
-        for data in calibration_data:
+        q_calibration_data: List[Union[QuantizedArray, numpy.ndarray]] = []
+        for idx, data in enumerate(calibration_data):
             is_clear_value = isinstance(data, RawOpOutput)
             if is_clear_value or data is None:
                 q_calibration_data.append(data)
             else:
-                q_calibration_data.append(
-                    QuantizedArray(n_bits, data, True, options=quantized_op.input_quant_opts)
-                )
+                quantizer = quantizers[idx]
+                if quantizer is None:
+                    q_calibration_data.append(
+                        QuantizedArray(n_bits, data, True, options=quantized_op.input_quant_opts)
+                    )
+                else:
+                    # Override, when necessary, the calibration data with data that is quantized
+                    # with layer quantizers that are overridden by the QAT graph quantizers
+                    q_calibration_data.append(
+                        QuantizedArray(
+                            quantizer.n_bits,
+                            data,
+                            True,
+                            options=quantizer.quant_options,
+                            stats=quantizer.quant_stats,
+                            params=quantizer.quant_params,
+                        )
+                    )
 
-        # Override, when necessary, the calibration data with data that is quantized with
-        # layer quantizers that are overridden by the QAT graph quantizers
-        for idx, data in enumerate(calibration_data):
-            if quantizers[idx] is None:
-                continue
+        # Fast quantization relies on an analytical computation
+        # of the output quantization parameters
+        if calibrate_mode == CalibrationMode.FAST_RAW:
+            assert isinstance(quantized_op, QuantizedMixingOp)
+            assert all(isinstance(inp, QuantizedArray) for inp in q_calibration_data)
 
-            quantizer = quantizers[idx]
-            assert quantizer is not None
+            # Calibrate the output of the layer using
+            # analytical formuals to avoid computation on quantized values
+            raw_result = quantized_op.calibrate(*q_calibration_data)
 
-            q_calibration_data[idx] = QuantizedArray(
-                quantizer.n_bits,
-                data,
-                True,
-                options=quantizer.quant_options,
-                stats=quantizer.quant_stats,
-                params=quantizer.quant_params,
+            output_quant_opts = QuantizationOptions(quantized_op.input_quant_opts.n_bits)
+            output_quant_opts.copy_opts(quantized_op.input_quant_opts)
+            return (
+                raw_result,
+                UniformQuantizer(
+                    output_quant_opts,
+                    quantized_op.output_quant_stats,
+                    quantized_op.output_quant_params,
+                ),
             )
+
+        # Calibrate the output of the layer
+        raw_result = quantized_op.calibrate(*calibration_data)
 
         # Enable rounding calibration if used has set a rounding_threshold_bits
         calibrate_attr = (
@@ -290,7 +424,9 @@ class ONNXConverter:
         )
         # For PTQ, the calibration is performed on quantized data. But
         # raw operation output (RawOpOutput) data should not be quantized
-        if calibrate_quantized and not isinstance(quant_result, RawOpOutput):
+        if calibrate_mode == CalibrationMode.QUANTIZED and not isinstance(
+            quant_result, RawOpOutput
+        ):
             assert isinstance(quant_result, QuantizedArray)
             return (
                 quant_result.dequant(),
@@ -305,7 +441,9 @@ class ONNXConverter:
         )
 
     @abstractmethod
-    def _process_initializer(self, n_bits: int, values: numpy.ndarray) -> QuantizedArray:
+    def _process_initializer(
+        self, n_bits: int, values: Union[numpy.ndarray, float, int, bool]
+    ) -> Union[QuantizedArray, RawOpOutput]:
         """Transform a constant tensor according to the model conversion mode.
 
         The values supplied are floating point values that will be quantized.
@@ -315,7 +453,8 @@ class ONNXConverter:
             values (numpy.ndarray): Float values that initialize this tensor
 
         Returns:
-            QuantizedArray: a quantized tensor with integer values on n_bits bits
+            Union[QuantizedArray, RawOpOutput]: a quantized tensor with integer
+                values on n_bits bits
         """
 
     @abstractmethod
@@ -376,6 +515,18 @@ class ONNXConverter:
 
         constants: Set[str] = set(self.quant_params.keys())
 
+        # Check if the model has only GLWE supported linear layers.
+        # In this case, use analytical calibration which is much faster
+        fast_calibration = True
+        for node in graph.node:
+            op_type = get_op_type(node)
+            if op_type == "Constant":
+                continue
+            quantized_op_class = ONNX_OPS_TO_QUANTIZED_IMPL[op_type]
+            if not quantized_op_class.supported_by_linear_backend():
+                fast_calibration = False
+                break
+
         # We need to determine, for each op, whether it only performs univariate computations.
         # A univariate computation is one which depends on a single scalar integer encrypted input
         # which is only multiplied or added to constants or to itself, or a nonlinear function is
@@ -423,10 +574,6 @@ class ONNXConverter:
 
             quantized_op_class = ONNX_OPS_TO_QUANTIZED_IMPL[op_type]
 
-            # Add rounding_threshold_bits to the attributes if available in quantized_op_class
-            if issubclass(quantized_op_class, QuantizedMixingOp):
-                attributes.update({"rounding_threshold_bits": self.rounding_threshold_bits})
-
             # All inputs, allow optional constants (they become None)
             # Note that input of a node can be duplicated, e.g., (%a, %a, %b)
             curr_inputs = [
@@ -444,14 +591,13 @@ class ONNXConverter:
                         curr_cst_inputs[input_idx] = value
                     else:
                         # Initializers are ndarray or scalar
-                        assert value is not None
-                        assert isinstance(value, numpy.ndarray) or numpy.isscalar(value)
+                        assert isinstance(value, (numpy.ndarray, float, int, bool))
                         curr_cst_inputs[input_idx] = self._process_initializer(
                             self.n_bits_op_weights, value
                         )
                 else:
                     # Initializers are ndarray or scalar
-                    assert isinstance(value, numpy.ndarray) or numpy.isscalar(value)
+                    assert isinstance(value, (numpy.ndarray, float, int, bool))
                     curr_cst_inputs[input_idx] = value
 
             has_variable_inputs = (len(curr_inputs) - len(curr_cst_inputs)) > 0
@@ -478,6 +624,12 @@ class ONNXConverter:
 
             # If we depend on a variable input use the quantized version of the operator
             if has_variable_inputs:
+
+                # Add rounding_threshold_bits to the attributes if available in quantized_op_class
+                # rounding_thresholds_bits only applies to QuantizedOp for now so we can't use them
+                # if we use the original operator on float (ops_impl.py)
+                if issubclass(quantized_op_class, QuantizedMixingOp):
+                    attributes.update({"rounding_threshold_bits": self.rounding_threshold_bits})
 
                 assert_true(
                     op_type in ONNX_OPS_TO_QUANTIZED_IMPL,
@@ -522,7 +674,10 @@ class ONNXConverter:
                     for input_name in variable_input_names
                 )
                 output_calibration_data, layer_quantizer = self._process_layer(
-                    quantized_op_instance, *curr_calibration_data, quantizers=layer_quant
+                    quantized_op_instance,
+                    *curr_calibration_data,
+                    quantizers=layer_quant,
+                    fast_calibration=fast_calibration,
                 )
                 node_results[output_name] = output_calibration_data
                 node_override_quantizer[output_name] = layer_quantizer
@@ -578,19 +733,26 @@ class ONNXConverter:
                 node_results[output_name] = node_output[0]
                 constants.add(output_name)
 
-    def quantize_module(self, *calibration_data: numpy.ndarray) -> QuantizedModule:
+    def quantize_module(
+        self, *calibration_data: numpy.ndarray, keep_onnx: Optional[bool] = True
+    ) -> QuantizedModule:
         """Quantize numpy module.
 
         Following https://arxiv.org/abs/1712.05877 guidelines.
 
         Args:
-            *calibration_data (numpy.ndarray):  Data that will be used to compute the bounds,
-                                                scales and zero point values for every quantized
-                                                object.
+            calibration_data (numpy.ndarray):  Data that will be used to compute the bounds,
+                scales and zero point values for every quantized object.
+            keep_onnx (bool): keep the onnx model inside the QuantizedModule. Set to False
+                to save memory. Keeping the onnx model is useful for debugging
 
         Returns:
             QuantizedModule: Quantized numpy module
         """
+
+        # Apply preprocessing
+        calibration_data = self.numpy_model.pre_processing(*calibration_data)
+
         # First transform all parameters to their quantized version
         self._quantize_params()
 
@@ -605,11 +767,12 @@ class ONNXConverter:
                 graph_output.name for graph_output in self.numpy_model.onnx_model.graph.output
             ),
             quant_layers_dict=self.quant_ops_dict,
-            onnx_model=self.numpy_model.onnx_model,
+            onnx_model=self.numpy_model.onnx_model if keep_onnx else None,
+            onnx_preprocessing=self.numpy_model.onnx_preprocessing,
         )
 
-        adapter = PowerOfTwoScalingRoundPBSAdapter(quantized_module)
         # Apply the round PBS optimization if possible
+        adapter = PowerOfTwoScalingRoundPBSAdapter(quantized_module)
         adapter.process()
 
         self._process_input_quantizers(quantized_module, calibration_data)
@@ -710,13 +873,6 @@ class ONNXConverter:
                 # use that op's quantization options (ensures matching options that allows
                 # the optimization to take place)
                 opts = layer_using_input[inp_idx][0].input_quant_opts
-                for layer in layer_using_input[inp_idx][1:]:
-                    opts_k = layer.input_quant_opts
-                    assert_true(
-                        opts.is_equal(opts_k),
-                        "Multiple quantizers "
-                        "applied to the same input must have the same quantization options",
-                    )
 
                 q_input_list.append(QuantizedArray(opts.n_bits, val, options=opts).quantizer)
 
@@ -741,8 +897,12 @@ class PostTrainingAffineQuantization(ONNXConverter):
                                         - op_weights: learned parameters or constants in the network
                                         - model_outputs: final model output quantization bits
         numpy_model (NumpyModule):      Model in numpy.
-        rounding_threshold_bits (int): if not None, every accumulators in the model are rounded down
-            to the given bits of precision
+        rounding_threshold_bits (Union[None, int, Dict[str, Union[str, int]]]): if not None, every
+                                        accumulators in the model are rounded down to the given
+                                        bits of precision. Can be an int or a dictionary with keys
+                                        'method' and 'n_bits', where 'method' is either
+                                        fhe.Exactness.EXACT or fhe.Exactness.APPROXIMATE, and
+                                        'n_bits' is either 'auto' or an int.
         is_signed:                      Whether the weights of the layers can be signed.
                                         Currently, only the weights can be signed.
 
@@ -755,6 +915,7 @@ class PostTrainingAffineQuantization(ONNXConverter):
         quantized_op: QuantizedOp,
         *calibration_data: numpy.ndarray,
         quantizers: List[Optional[UniformQuantizer]],
+        fast_calibration: bool = False,
     ) -> Tuple[numpy.ndarray, Optional[UniformQuantizer]]:
         """Configure a graph operation by performing calibration for uniform quantization.
 
@@ -766,16 +927,34 @@ class PostTrainingAffineQuantization(ONNXConverter):
                 should produce the quantized values used in calibration. If none are given,
                 the calibration will generate the quantized values with the layer's input
                 calibration options.
+            fast_calibration (bool): whether to perform calibration without
+                computing the result of the operation on calibration data, but
+                rather by using analytical formulas to determine the output
+                quantization parameters
 
         Returns:
             numpy.ndarray: calibration data for the following operators
         """
 
-        return self._calibrate_layers_activation(
-            True, quantized_op, *calibration_data, quantizers=quantizers
+        # Fast calibration can only be enabled in special cases such as a module with
+        # only a single Gemm layer
+        calibrate_mode = CalibrationMode.FAST_RAW if fast_calibration else CalibrationMode.QUANTIZED
+
+        # Only mixing ops (e.g., gemm/add) can use fast calibrate (which doesn't call the q_impl)
+        assert calibrate_mode != CalibrationMode.FAST_RAW or isinstance(
+            quantized_op, QuantizedMixingOp
         )
 
-    def _process_initializer(self, n_bits: int, values: numpy.ndarray):
+        return self._calibrate_layers_activation(
+            calibrate_mode,
+            quantized_op,
+            *calibration_data,
+            quantizers=quantizers,
+        )
+
+    def _process_initializer(
+        self, n_bits: int, values: Union[numpy.ndarray, float, int, bool]
+    ) -> Union[QuantizedArray, RawOpOutput]:
         """Quantize a network constant tensor (a weights tensor).
 
         The values supplied are floating point values that will be quantized.
@@ -785,14 +964,23 @@ class PostTrainingAffineQuantization(ONNXConverter):
             values (numpy.ndarray): Float values that initialize this tensor
 
         Returns:
-            QuantizedArray: a quantized tensor with integer values on n_bits bits
+            Union[QuantizedArray, RawOpOutput]: a quantized tensor with integer
+                values on n_bits bits
         """
 
         if isinstance(values, numpy.ndarray) and numpy.issubdtype(values.dtype, numpy.integer):
             return values.view(RawOpOutput)
-
-        assert isinstance(values, (numpy.ndarray, float))
-        is_signed = is_symmetric = self._check_distribution_is_symmetric_around_zero(values)
+        if not isinstance(values, (numpy.ndarray, Tracer)):
+            values = numpy.array(values)
+        if not numpy.issubdtype(values.dtype, numpy.bool_):
+            is_signed = is_symmetric = self._check_distribution_is_symmetric_around_zero(values)
+        # Boolean parameters are quantized to 1 bit
+        # FIXME: https://github.com/zama-ai/concrete-ml-internal/issues/4593
+        # We should not quantize boolean parameters in the future
+        else:
+            is_signed = is_symmetric = False
+            n_bits = 1
+            values = values.astype(numpy.float64)
 
         return QuantizedArray(
             n_bits,
@@ -880,6 +1068,7 @@ class PostTrainingQATImporter(ONNXConverter):
         quantized_op: QuantizedOp,
         *calibration_data: numpy.ndarray,
         quantizers: List[Optional[UniformQuantizer]],
+        fast_calibration: bool = False,
     ) -> Tuple[numpy.ndarray, Optional[UniformQuantizer]]:
         """Configure a graph operation by calibrating it for Quantization Aware Training.
 
@@ -891,16 +1080,22 @@ class PostTrainingQATImporter(ONNXConverter):
                 should produce the quantized values used in calibration. If none are given,
                 the calibration will generate the quantized values with the layer's input
                 calibration options.
+            fast_calibration (bool): whether to perform calibration without
+                computing the result of the operation on calibration data, but
+                rather by using analytical formulas to determine the output
+                quantization parameters
 
         Returns:
             numpy.ndarray: calibration data for the following operators
         """
 
         return self._calibrate_layers_activation(
-            False, quantized_op, *calibration_data, quantizers=quantizers
+            CalibrationMode.RAW, quantized_op, *calibration_data, quantizers=quantizers
         )
 
-    def _process_initializer(self, n_bits: int, values: numpy.ndarray):
+    def _process_initializer(
+        self, n_bits: int, values: Union[numpy.ndarray, float, int, bool]
+    ) -> Union[QuantizedArray, RawOpOutput]:
         """Process an already quantized weight tensor.
 
         The values supplied are in floating point, but are discrete, in the sense
@@ -913,8 +1108,8 @@ class PostTrainingQATImporter(ONNXConverter):
             values (numpy.ndarray): Discrete float values that initialize this tensor
 
         Returns:
-            QuantizedArray: a quantized tensor with integer values on n_bits bits and with alpha as
-                the scaling factor.
+            Union[QuantizedArray, RawOpOutput]: a quantized tensor with integer values on
+                n_bits bits and with alpha as the scaling factor.
         """
 
         # Assume that integer initializer op inputs are raw values that should not be quantized
